@@ -21,3 +21,7 @@ TAGS
 .gradle
 kafka.ipr
 kafka.iws
+
+core/out/*
+gradle/wrapper/gradle-wrapper.properties
+gradle/wrapper/gradle-wrapper.jar

@@ -1,105 +1,79 @@
-Apache Kafka
-=================
-See our [web site](http://kafka.apache.org) for details on the project.
+# readme
 
-You need to have [gradle](http://www.gradle.org/installation) installed.
+## 编译
 
-### First bootstrap and download the wrapper ###
-    cd kafka_source_dir
-    gradle
+### MavenDeployment
 
-Now everything else will work
+> 使用 `gradle 6.2` 可以直接编译，更高版本的部分插件被移除。
 
-### Building a jar and running it ###
-    ./gradlew jar  
+### ScalaCompileOptions.metaClass.useAnt ...
 
-Follow instuctions in http://kafka.apache.org/documentation.html#quickstart
+> 在 `build.gradle` 最上方添加
+>
+> ```java
+> ScalaCompileOptions.metaClass.daemonServer = true
+> ScalaCompileOptions.metaClass.fork = true
+> ScalaCompileOptions.metaClass.useAnt = false
+> ScalaCompileOptions.metaClass.useCompileDaemon = false
+> ```
 
-### Building source jar ###
-    ./gradlew srcJar
+### allowInsecureProtocol
 
-### Building javadocs and scaladocs ###
-    ./gradlew javadoc
-    ./gradlew javadocJar # builds a jar from the javadocs
-    ./gradlew scaladoc
-    ./gradlew scaladocJar # builds a jar from the scaladocs
-    ./gradlew docsJar # builds both javadoc and scaladoc jar
+> gradle 要求用户使用私有库时显示的声明，所以在 buildscript.gradle 中增加配置
+>
+> ```json
+> repositories {
+>   repositories {
+>     // For license plugin.
+>     maven {
+>       url = 'http://dl.bintray.com/content/netflixoss/external-gradle-plugins/'
+>       allowInsecureProtocol = true
+>     }
+>   }
+> }
+> ```
 
-### Running unit tests ###
-    ./gradlew test
 
-### Forcing re-running unit tests w/o code change ###
-    ./gradlew cleanTest test
 
-### Running a particular unit test ###
-    ./gradlew -Dtest.single=RequestResponseSerializationTest core:test
 
-### Running a particular unit test with log4j output ###
-    change the log4j setting in either clients/src/test/resources/log4j.properties or core/src/test/resources/log4j.properties
-    ./gradlew -i -Dtest.single=RequestResponseSerializationTest core:test
 
-### Building a binary release gzipped tar ball ###
-    ./gradlew clean
-    ./gradlew releaseTarGz  
-    The above command will fail if you haven't set up the signing key. To bypass signing the artifact, you can run
-    ./gradlew releaseTarGz -x signArchives
 
-The release file can be found inside ./core/build/distributions/.
 
-### Cleaning the build ###
-    ./gradlew clean
 
-### Running a task on a particular version of Scala (either 2.9.1, 2.9.2, 2.10.4 or 2.11.5) ###
-#### (If building a jar with a version other than 2.10, need to set SCALA_BINARY_VERSION variable or change it in bin/kafka-run-class.sh to run quick start.) ####
-    ./gradlew -PscalaVersion=2.9.1 jar
-    ./gradlew -PscalaVersion=2.9.1 test
-    ./gradlew -PscalaVersion=2.9.1 releaseTarGz
 
-### Running a task for a specific project ###
-This is for 'core', 'contrib:hadoop-consumer', 'contrib:hadoop-producer', 'examples' and 'clients'
-    ./gradlew core:jar
-    ./gradlew core:test
 
-### Listing all gradle tasks ###
-    ./gradlew tasks
 
-### Building IDE project ####
-    ./gradlew eclipse
-    ./gradlew idea
 
-### Building the jar for all scala versions and for all projects ###
-    ./gradlew jarAll
 
-### Running unit tests for all scala versions and for all projects ###
-    ./gradlew testAll
 
-### Building a binary release gzipped tar ball for all scala versions ###
-    ./gradlew releaseTarGzAll
 
-### Publishing the jar for all version of Scala and for all projects to maven ###
-    ./gradlew uploadArchivesAll
 
-Please note for this to work you should create/update `~/.gradle/gradle.properties` and assign the following variables
 
-    mavenUrl=
-    mavenUsername=
-    mavenPassword=
-    signing.keyId=
-    signing.password=
-    signing.secretKeyRingFile=
 
-### Building the test jar ###
-    ./gradlew testJar
 
-### Determining how transitive dependencies are added ###
-    ./gradlew core:dependencies --configuration runtime
 
-### Contribution ###
 
-Apache Kafka is interested in building the community; we would welcome any thoughts or [patches](https://issues.apache.org/jira/browse/KAFKA). You can reach us [on the Apache mailing lists](http://kafka.apache.org/contact.html).
 
-To contribute follow the instructions here:
- * http://kafka.apache.org/contributing.html
 
-We also welcome patches for the website and documentation which can be found here:
- * https://svn.apache.org/repos/asf/kafka/site
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
