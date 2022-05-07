@@ -63,12 +63,12 @@ class SocketServer(val brokerId: Int,
   def startup() {
     val quotas = new ConnectionQuotas(maxConnectionsPerIp, maxConnectionsPerIpOverrides)
     for(i <- 0 until numProcessorThreads) {
-      processors(i) = new Processor(i, 
-                                    time, 
-                                    maxRequestSize, 
+      processors(i) = new Processor(i,
+                                    time,
+                                    maxRequestSize,
                                     aggregateIdleMeter,
                                     newMeter("IdlePercent", "percent", TimeUnit.NANOSECONDS, Map("networkProcessor" -> i.toString)),
-                                    numProcessorThreads, 
+                                    numProcessorThreads,
                                     requestChannel,
                                     quotas,
                                     connectionsMaxIdleMs)
@@ -81,7 +81,7 @@ class SocketServer(val brokerId: Int,
 
     // register the processor threads for notification of responses
     requestChannel.addResponseListener((id:Int) => processors(id).wakeup())
-   
+
     // start accepting connections
     this.acceptor = new Acceptor(host, port, processors, sendBufferSize, recvBufferSize, quotas)
     Utils.newThread("kafka-socket-acceptor", acceptor, false).start()
@@ -202,16 +202,19 @@ private[kafka] class Acceptor(val host: String,
                               val sendBufferSize: Int, 
                               val recvBufferSize: Int,
                               connectionQuotas: ConnectionQuotas) extends AbstractServerThread(connectionQuotas) {
+  // 开启 Socket 服务
   val serverChannel = openServerSocket(host, port)
 
   /**
    * Accept loop that checks for new connection attempts
    */
   def run() {
-    serverChannel.register(selector, SelectionKey.OP_ACCEPT);
+    // NIO 注册时间接收连接请求
+    serverChannel.register(selector, SelectionKey.OP_ACCEPT)
     startupComplete()
     var currentProcessor = 0
     while(isRunning) {
+      // 查看新增的连接请求
       val ready = selector.select(500)
       if(ready > 0) {
         val keys = selector.selectedKeys()
@@ -221,9 +224,10 @@ private[kafka] class Acceptor(val host: String,
           try {
             key = iter.next
             iter.remove()
-            if(key.isAcceptable)
+            if(key.isAcceptable) {
+               // 基于轮序获取一个处理线程
                accept(key, processors(currentProcessor))
-            else
+            } else
                throw new IllegalStateException("Unrecognized key state for acceptor thread.")
 
             // round robin to the next processor thread
@@ -234,6 +238,7 @@ private[kafka] class Acceptor(val host: String,
         }
       }
     }
+    // 退出 kafka，清理资源
     debug("Closing server socket and selector.")
     swallowError(serverChannel.close())
     swallowError(selector.close())
@@ -313,13 +318,15 @@ private[kafka] class Processor(val id: Int,
     startupComplete()
     while(isRunning) {
       // setup any new connections that have been queued up
+      // 在 accept 方法中，会把所有的 connection 放到一个队列中
       configureNewConnections()
-      // register any new responses for writing
+      // 从 RequestChannel 中获取响应并根据 ResponseAction 类型返回
       processNewResponses()
       val startSelectTime = SystemTime.nanoseconds
       val ready = selector.select(300)
       currentTimeNanos = SystemTime.nanoseconds
       val idleTime = currentTimeNanos - startSelectTime
+      // 标记工作线程 selector 阻塞时间
       idleMeter.mark(idleTime)
       // We use a single meter for aggregate idle percentage for the thread pool.
       // Since meter is calculated as total_recorded_value / time_window and
@@ -375,6 +382,9 @@ private[kafka] class Processor(val id: Int,
   }
 
   private def processNewResponses() {
+    // requestChannel 的类型是 RequestChannel，他在 sendRequest 阶段
+    // 添加了 RequestChannel.Request(processor = id, requestKey = key, buffer = receive.buffer, startTimeMs = time.milliseconds, remoteAddress = address)
+    // 到队列
     var curr = requestChannel.receiveResponse(id)
     while(curr != null) {
       val key = curr.request.requestKey.asInstanceOf[SelectionKey]
@@ -426,6 +436,7 @@ private[kafka] class Processor(val id: Int,
     while(newConnections.size() > 0) {
       val channel = newConnections.poll()
       debug("Processor " + id + " listening to new connection from " + channel.socket.getRemoteSocketAddress)
+      // 注意，这个 selector 是 Processor 自己的 selector
       channel.register(selector, SelectionKey.OP_READ)
     }
   }
