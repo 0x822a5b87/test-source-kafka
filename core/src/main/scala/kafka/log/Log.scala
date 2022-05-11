@@ -427,19 +427,21 @@ class Log(val dir: File,
 
     // check if the offset is valid and in range
     val next = nextOffsetMetadata.messageOffset
+    // 如果已经是当前最大的 offset，那么无数据读取
     if(startOffset == next)
       return FetchDataInfo(nextOffsetMetadata, MessageSet.Empty)
-    
+
+    // 查找具体在哪个 LogSegment，这就是为什么 segments 的底层实现是一个跳跃表
     var entry = segments.floorEntry(startOffset)
       
     // attempt to read beyond the log end offset is an error
     if(startOffset > next || entry == null)
       throw new OffsetOutOfRangeException("Request for offset %d but we only have log segments in the range %d to %d.".format(startOffset, segments.firstKey, next))
-    
-    // do the read on the segment with a base offset less than the target offset
-    // but if that segment doesn't contain any messages with an offset greater than that
-    // continue to read from successive segments until we get some messages or we reach the end of the log
+
+    // 尝试从 LogSegment 中读取数据，如果当前 LogSegment 没有我们要读的数据
+    // 就找到下一个 entry 尝试读取数据，直到读到数据或者没有最新的 LogSegment
     while(entry != null) {
+      // entry.getValue 是我们刚才基于 startOffset 找到的 LogSegment
       val fetchInfo = entry.getValue.read(startOffset, maxOffset, maxLength)
       if(fetchInfo == null) {
         entry = segments.higherEntry(entry.getKey)
@@ -448,9 +450,8 @@ class Log(val dir: File,
       }
     }
     
-    // okay we are beyond the end of the last segment with no data fetched although the start offset is in range,
-    // this can happen when all messages with offset larger than start offsets have been deleted.
-    // In this case, we will return the empty set with log end offset metadata
+    // 我们已经查找到最后的 Segment，但是我们还是无法读取到数据，虽然给定的 startOffset 是在我们 LogSegment 的范围中。
+    // 当所有偏移量大于起始偏移量的消息都被删除时，就会发生这种情况。
     FetchDataInfo(nextOffsetMetadata, MessageSet.Empty)
   }
 

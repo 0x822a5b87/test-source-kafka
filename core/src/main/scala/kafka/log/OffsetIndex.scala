@@ -127,9 +127,9 @@ class OffsetIndex(@volatile var file: File, val baseOffset: Long, val maxIndexSi
       val idx = mmap.duplicate
       val slot = indexSlotFor(idx, targetOffset)
       if(slot == -1)
-        OffsetPosition(baseOffset, 0)
+        return OffsetPosition(baseOffset, 0)
       else
-        OffsetPosition(baseOffset + relativeOffset(idx, slot), physical(idx, slot))
+        return OffsetPosition(baseOffset + relativeOffset(idx, slot), physical(idx, slot))
       }
   }
   
@@ -143,6 +143,7 @@ class OffsetIndex(@volatile var file: File, val baseOffset: Long, val maxIndexSi
    * @return The slot found or -1 if the least entry in the index is larger than the target offset or the index is empty
    */
   private def indexSlotFor(idx: ByteBuffer, targetOffset: Long): Int = {
+
     // we only store the difference from the base offset so calculate that
     val relOffset = targetOffset - baseOffset
     
