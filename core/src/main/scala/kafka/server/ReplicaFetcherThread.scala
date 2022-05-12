@@ -37,23 +37,36 @@ class ReplicaFetcherThread(name:String,
                                 fetcherBrokerId = brokerConfig.brokerId,
                                 maxWait = brokerConfig.replicaFetchWaitMaxMs,
                                 minBytes = brokerConfig.replicaFetchMinBytes,
-                                isInterruptible = false) {
+                                isInterruptable = false) {
 
-  // process fetched data
+  /**
+   * process fetched data
+   * @param topicAndPartition FetchResponse 中返回的 <TopicAndPartition>
+   * @param fetchOffset       broke 上当前 <TopicAndPartition> 的 offset
+   * @param partitionData     FetchResponse 返回的 <FetchResponsePartitionData>
+   */
   def processPartitionData(topicAndPartition: TopicAndPartition, fetchOffset: Long, partitionData: FetchResponsePartitionData) {
     try {
       val topic = topicAndPartition.topic
       val partitionId = topicAndPartition.partition
+      // 获取所有副本信息
       val replica = replicaMgr.getReplica(topic, partitionId).get
       val messageSet = partitionData.messages.asInstanceOf[ByteBufferMessageSet]
 
+      // fetchOffset 是当前 <partitionMap> 中的 offset
+      // logEndOffset 有两种
+      // for local replica it is the log's end offset, for remote replicas its value is only updated by follower fetch
       if (fetchOffset != replica.logEndOffset.messageOffset)
         throw new RuntimeException("Offset mismatch: fetched offset = %d, log end offset = %d.".format(fetchOffset, replica.logEndOffset.messageOffset))
       trace("Follower %d has replica log end offset %d for partition %s. Received %d messages and leader hw %d"
             .format(replica.brokerId, replica.logEndOffset.messageOffset, topicAndPartition, messageSet.sizeInBytes, partitionData.hw))
+      // 将日志写入对应的 LogSegment
       replica.log.get.append(messageSet, assignOffsets = false)
       trace("Follower %d has replica log end offset %d after appending %d bytes of messages for partition %s"
             .format(replica.brokerId, replica.logEndOffset.messageOffset, messageSet.sizeInBytes, topicAndPartition))
+      // 设置 HighWatermark 为 logEndOffset 与 <FetchResponsePartitionData> 中 HighWatermark 的最小值
+      // 这个会影响 kafka 消费和生产行为
+      // 例如，在部分生产行为下，只有当消息被所有的副本都拉取备份之后才会被认为已经正常写入。
       val followerHighWatermark = replica.logEndOffset.messageOffset.min(partitionData.hw)
       // for the follower replica, we do not need to keep
       // its segment base offset the physical position,

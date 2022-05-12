@@ -38,11 +38,12 @@ import com.yammer.metrics.core.Gauge
  */
 abstract class AbstractFetcherThread(name: String, clientId: String, sourceBroker: Broker, socketTimeout: Int, socketBufferSize: Int,
                                      fetchSize: Int, fetcherBrokerId: Int = -1, maxWait: Int = 0, minBytes: Int = 1,
-                                     isInterruptible: Boolean = true)
-  extends ShutdownableThread(name, isInterruptible) {
+                                     isInterruptable: Boolean = true)
+  extends ShutdownableThread(name, isInterruptable) {
   private val partitionMap = new mutable.HashMap[TopicAndPartition, Long] // a (topic, partition) -> offset map
   private val partitionMapLock = new ReentrantLock
   private val partitionMapCond = partitionMapLock.newCondition()
+  // FetcherThread 通过 SimpleConsumer 拉取数据，拉取到数据后同步到 replic
   val simpleConsumer = new SimpleConsumer(sourceBroker.host, sourceBroker.port, socketTimeout, socketBufferSize, clientId)
   private val metricId = new ClientIdAndBroker(clientId, sourceBroker.host, sourceBroker.port)
   val fetcherStats = new FetcherStats(metricId)
@@ -72,8 +73,10 @@ abstract class AbstractFetcherThread(name: String, clientId: String, sourceBroke
 
   override def doWork() {
     inLock(partitionMapLock) {
+      // doWork() 方法在 while 循环中调用，等待200ms可以避免忙等待。
       if (partitionMap.isEmpty)
         partitionMapCond.await(200L, TimeUnit.MILLISECONDS)
+      // partitionMap 存放了该 fetch 线程所有负责拉取的 TopicAndPartition
       partitionMap.foreach {
         case((topicAndPartition, offset)) =>
           fetchRequestBuilder.addFetch(topicAndPartition.topic, topicAndPartition.partition,

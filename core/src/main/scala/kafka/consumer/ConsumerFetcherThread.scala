@@ -38,7 +38,7 @@ class ConsumerFetcherThread(name: String,
                                       fetcherBrokerId = Request.OrdinaryConsumerId,
                                       maxWait = config.fetchWaitMaxMs,
                                       minBytes = config.fetchMinBytes,
-                                      isInterruptible = true) {
+                                      isInterruptable = true) {
 
   // process fetched data
   def processPartitionData(topicAndPartition: TopicAndPartition, fetchOffset: Long, partitionData: FetchResponsePartitionData) {

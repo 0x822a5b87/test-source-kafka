@@ -6,7 +6,13 @@
 
 ## 问题记录
 
-1. kafka 的实际日志由 `OffsetIndex` 和 `FileMessageSet` 两个部分组成，其中 `OffsetIndex` 被映射成了一个 MMap；那么 kafka 怎么保证它和 FileMessageStat 是对得上的呢？
+### OffsetIndex and FileMessageSet
+
+> kafka 的实际日志由 `OffsetIndex` 和 `FileMessageSet` 两个部分组成，其中 `OffsetIndex` 被映射成了一个 MMap；那么 kafka 怎么保证它和 FileMessageStat 是对得上的呢？
+
+### read(startOffset: Long, maxLength: Int, maxOffset: Option[Long] = None): 
+
+> 为什么 LogManager 在读数据的时候，需要有一个 `maxOffset` 指定可以拉取的最大偏移数？
 
 ## 编译
 
@@ -917,9 +923,500 @@ class LogManager(val logDirs: Array[File],
   }
 ```
 
+#### 4.3.2 ReplicaManager
 
+> ReplicManager 负责针对 topic 的分区副本数据的同步功能，ReplicManager 主要利用 `ReplicaFetcherThread` 和 `HighWatermark` 来实现数据同步管理。
+>
+> 简单来说，在 `AbstractFetcherThread` 中保存了 `partitionMap`，同时有一个线程一直通过读取 `partitionMap` 并组装 `FetchRequest` 向 `leader` 请求数据。
 
+###### HighWatermark、LogEndOffset
 
+> kafka 的日志包含了两个不同的偏移量，分别是 `HighWatemark` 和 `LogEndOffset`；
+>
+> - HighWatermark：在leader中代表了所有的ISR中Replica的 last commited messages 的最小值，这代表小于这个 offset 的值所有的 ISR 都已经通过 `FetchRequest` 获取到；在 follower 中，他只代表了他的 offset。
+> - LogEndOffset：对于本地 replica 代表了文件的 offset，对于 remote replicas，这个值由 follower fetch 更新。在每次 `FetchRequest` 时，follower 会上报自己的 LogEndOffset。
+
+![HighWatermark.drawio.png](source/HighWatermark.drawio.png)
+
+```scala
+  // the high watermark offset value, in non-leader replicas only its message offsets are kept
+  @volatile private[this] var highWatermarkMetadata: LogOffsetMetadata = new LogOffsetMetadata(initialHighWatermarkValue)
+  // the log end offset value, kept in all replicas;
+  // for local replica it is the log's end offset, for remote replicas its value is only updated by follower fetch
+  @volatile private[this] var logEndOffsetMetadata: LogOffsetMetadata = LogOffsetMetadata.UnknownOffsetMetadata
+```
+
+###### Partition
+
+> `controllerEpoch` 会在 `makeFollower` 和 `makeLeader` 中被修改，这意味着在某一个时刻，针对于某个 `epoch` 的投票达成了一致。
+
+```scala
+class Partition(val topic: String,
+                val partitionId: Int,
+                time: Time,
+                replicaManager: ReplicaManager) extends Logging with KafkaMetricsGroup {
+  private val localBrokerId = replicaManager.config.brokerId
+  private val logManager = replicaManager.logManager
+  private val zkClient = replicaManager.zkClient
+  // AR
+  private val assignedReplicaMap = new Pool[Int, Replica]
+  // The read lock is only required when multiple reads are executed and needs to be in a consistent manner
+  private val leaderIsrUpdateLock = new ReentrantReadWriteLock()
+  private var zkVersion: Int = LeaderAndIsr.initialZKVersion
+  @volatile private var leaderEpoch: Int = LeaderAndIsr.initialLeaderEpoch - 1
+  @volatile var leaderReplicaIdOpt: Option[Int] = None
+  // ISR
+  @volatile var inSyncReplicas: Set[Replica] = Set.empty[Replica]
+  /* Epoch of the controller that last changed the leader. This needs to be initialized correctly upon broker startup.
+   * One way of doing that is through the controller's start replica state change command. When a new broker starts up
+   * the controller sends it a start replica command containing the leader for each partition that the broker hosts.
+   * In addition to the leader, the controller can also send the epoch of the controller that elected the leader for
+   * each partition. */
+  private var controllerEpoch: Int = KafkaController.InitialControllerEpoch - 1
+
+}
+```
+
+###### Replica
+
+```scala
+/**
+ * @param brokerId 所在的 broker ID
+ * @param partition 所在的分区
+ * @param initialHighWatermarkValue 初始的 HighWatermark
+ * @param log 对应的日志
+ */
+class Replica(val brokerId: Int,
+              val partition: Partition,
+              time: Time = SystemTime,
+              initialHighWatermarkValue: Long = 0L,
+              val log: Option[Log] = None) extends Logging {
+  // the high watermark offset value, in non-leader replicas only its message offsets are kept
+  @volatile private[this] var highWatermarkMetadata: LogOffsetMetadata = new LogOffsetMetadata(initialHighWatermarkValue)
+  // the log end offset value, kept in all replicas;
+  // for local replica it is the log's end offset, for remote replicas its value is only updated by follower fetch
+  @volatile private[this] var logEndOffsetMetadata: LogOffsetMetadata = LogOffsetMetadata.UnknownOffsetMetadata
+  // the time when log offset is updated
+  private[this] val logEndOffsetUpdateTimeMsValue = new AtomicLong(time.milliseconds)
+
+  val topic = partition.topic
+  val partitionId = partition.partitionId
+
+}
+```
+
+###### processPartitionData
+
+```scala
+  /**
+   * process fetched data
+   * @param topicAndPartition FetchResponse 中返回的 <TopicAndPartition>
+   * @param fetchOffset       broke 上当前 <TopicAndPartition> 的 offset
+   * @param partitionData     FetchResponse 返回的 <FetchResponsePartitionData>
+   */
+  def processPartitionData(topicAndPartition: TopicAndPartition, fetchOffset: Long, partitionData: FetchResponsePartitionData) {
+    try {
+      val topic = topicAndPartition.topic
+      val partitionId = topicAndPartition.partition
+      // 获取所有副本信息
+      val replica = replicaMgr.getReplica(topic, partitionId).get
+      val messageSet = partitionData.messages.asInstanceOf[ByteBufferMessageSet]
+
+      // fetchOffset 是当前 <partitionMap> 中的 offset
+      // logEndOffset 有两种
+      // for local replica it is the log's end offset, for remote replicas its value is only updated by follower fetch
+      if (fetchOffset != replica.logEndOffset.messageOffset)
+        throw new RuntimeException("Offset mismatch: fetched offset = %d, log end offset = %d.".format(fetchOffset, replica.logEndOffset.messageOffset))
+      trace("Follower %d has replica log end offset %d for partition %s. Received %d messages and leader hw %d"
+            .format(replica.brokerId, replica.logEndOffset.messageOffset, topicAndPartition, messageSet.sizeInBytes, partitionData.hw))
+      // 将日志写入对应的 LogSegment
+      replica.log.get.append(messageSet, assignOffsets = false)
+      trace("Follower %d has replica log end offset %d after appending %d bytes of messages for partition %s"
+            .format(replica.brokerId, replica.logEndOffset.messageOffset, messageSet.sizeInBytes, topicAndPartition))
+      // 设置 HighWatermark 为 logEndOffset 与 <FetchResponsePartitionData> 中 HighWatermark 的最小值
+      // 这个会影响 kafka 消费和生产行为
+      // 例如，在部分生产行为下，只有当消息被所有的副本都拉取备份之后才会被认为已经正常写入。
+      val followerHighWatermark = replica.logEndOffset.messageOffset.min(partitionData.hw)
+      // for the follower replica, we do not need to keep
+      // its segment base offset the physical position,
+      // these values will be computed upon making the leader
+      replica.highWatermark = new LogOffsetMetadata(followerHighWatermark)
+      trace("Follower %d set replica high watermark for partition [%s,%d] to %s"
+            .format(replica.brokerId, topic, partitionId, followerHighWatermark))
+    } catch {
+      case e: KafkaStorageException =>
+        fatal("Disk error while replicating data.", e)
+        Runtime.getRuntime.halt(1)
+    }
+  }
+```
+
+###### 4.3.2.1 becomeLeaderOrFollower
+
+```scala
+  /**
+   * broker 接受 controller 的 LeaderAndIsrRequest 请求并判断自己是成为 leader 还是 follower
+   *
+   * @param leaderAndISRRequest 来自 broker 的 <LeaderAndIsrRequest>
+   * @param offsetManager       <OffsetManager>
+   * @return
+   */
+  def becomeLeaderOrFollower(leaderAndISRRequest: LeaderAndIsrRequest,
+                             offsetManager: OffsetManager): (collection.Map[(String, Int), Short], Short) = {
+    replicaStateChangeLock synchronized {
+      
+      val responseMap = new collection.mutable.HashMap[(String, Int), Short]
+      // 如果 epoch 小于 controller 的 epoch，那么说明用户已经收到了一个更新的 request，不接受该提案
+      if(leaderAndISRRequest.controllerEpoch < controllerEpoch) {
+        leaderAndISRRequest.partitionStateInfos.foreach { case ((topic, partition), stateInfo) =>
+        stateChangeLogger.warn(("Broker %d ignoring LeaderAndIsr request from controller %d with correlation id %d since " +
+          "its controller epoch %d is old. Latest known controller epoch is %d").format(localBrokerId, leaderAndISRRequest.controllerId,
+          leaderAndISRRequest.correlationId, leaderAndISRRequest.controllerEpoch, controllerEpoch))
+        }
+        (responseMap, ErrorMapping.StaleControllerEpochCode)
+      } else {
+        val controllerId = leaderAndISRRequest.controllerId
+        val correlationId = leaderAndISRRequest.correlationId
+        // 修改 controllerEpoch
+        controllerEpoch = leaderAndISRRequest.controllerEpoch
+
+        // First check partition's leader epoch
+        val partitionState = new HashMap[Partition, PartitionStateInfo]()
+        leaderAndISRRequest.partitionStateInfos.foreach {
+          case ((topic, partitionId), partitionStateInfo) =>
+            val partition = getOrCreatePartition(topic, partitionId)
+            val partitionLeaderEpoch = partition.getLeaderEpoch()
+            // 如果leader epoch有效，则记录做出领导决策的控制器的epoch。
+            // This is useful while updating the isr to maintain the decision maker controller's epoch in the zookeeper path
+            if (partitionLeaderEpoch < partitionStateInfo.leaderIsrAndControllerEpoch.leaderAndIsr.leaderEpoch) {
+              if (partitionStateInfo.allReplicas.contains(config.brokerId))
+                partitionState.put(partition, partitionStateInfo)
+              else {
+                stateChangeLogger.warn(("Broker %d ignoring LeaderAndIsr request from controller %d with correlation id %d " +
+                  "epoch %d for partition [%s,%d] as itself is not in assigned replica list %s")
+                  .format(localBrokerId, controllerId, correlationId, leaderAndISRRequest.controllerEpoch,
+                    topic, partition.partitionId, partitionStateInfo.allReplicas.mkString(",")))
+              }
+            } else {
+              // Otherwise record the error code in response
+              stateChangeLogger.warn(("Broker %d ignoring LeaderAndIsr request from controller %d with correlation id %d " +
+                "epoch %d for partition [%s,%d] since its associated leader epoch %d is old. Current leader epoch is %d")
+                .format(localBrokerId, controllerId, correlationId, leaderAndISRRequest.controllerEpoch,
+                  topic, partition.partitionId, partitionStateInfo.leaderIsrAndControllerEpoch.leaderAndIsr.leaderEpoch, partitionLeaderEpoch))
+              responseMap.put((topic, partitionId), ErrorMapping.StaleLeaderEpochCode)
+            }
+        }
+
+        // 对于 controller 返回的 LeaderAndIsrRequest，如果 partitionStateInfo 中的 leader 等于该broker 的 id
+        // 那么说明这个分区是 leader 分区
+        val partitionsTobeLeader = partitionState
+          .filter { case (partition, partitionStateInfo) => partitionStateInfo.leaderIsrAndControllerEpoch.leaderAndIsr.leader == config.brokerId}
+        // 否则成为 follower
+        val partitionsToBeFollower = (partitionState -- partitionsTobeLeader.keys)
+
+        // 创建 leader
+        if (partitionsTobeLeader.nonEmpty) {
+          makeLeaders(controllerId, controllerEpoch, partitionsTobeLeader, leaderAndISRRequest.correlationId, responseMap, offsetManager)
+        }
+        // 创建 follower
+        if (partitionsToBeFollower.nonEmpty)
+          makeFollowers(controllerId, controllerEpoch, partitionsToBeFollower, leaderAndISRRequest.leaders, leaderAndISRRequest.correlationId, responseMap, offsetManager)
+
+        // we initialize highWatermark thread after the first leaderIsrRequest. This ensures that all the partitions
+        // have been completely populated before starting the checkpointing there by avoiding weird race conditions
+        if (!hwThreadInitialized) {
+          // 开启 HighWatermark-checkpoint 线程，该线程负责将 HighWatermark 刷新到 replication-offset-checkpoint 文件
+          startHighWaterMarksCheckPointThread()
+          hwThreadInitialized = true
+        }
+        replicaFetcherManager.shutdownIdleFetcherThreads()
+        (responseMap, ErrorMapping.NoError)
+      }
+    }
+  }
+```
+
+> makeLeaders
+
+```scala
+  /*
+   * Make the current broker to become leader for a given set of partitions by:
+   *
+   * 1. Stop fetchers for these partitions
+   * 2. Update the partition metadata in cache
+   * 3. Add these partitions to the leader partitions set
+   *
+   * If an unexpected error is thrown in this function, it will be propagated to KafkaApis where
+   * the error message will be set on each partition since we do not know which partition caused it
+   *  TODO: the above may need to be fixed later
+   */
+  private def makeLeaders(controllerId: Int, epoch: Int,
+                          partitionsTobeLeader: Map[Partition, PartitionStateInfo],
+                          correlationId: Int, responseMap: mutable.Map[(String, Int), Short],
+                          offsetManager: OffsetManager) = {
+    // 生成返回值，这个值会被包装到 <LeaderAndIsrResponse> 后返回给 controller
+    for (partition <- partitionsTobeLeader.keys)
+      responseMap.put((partition.topic, partition.partitionId), ErrorMapping.NoError)
+
+    try {
+      // First stop fetchers for all the partitions
+      replicaFetcherManager.removeFetcherForPartitions(partitionsTobeLeader.keySet.map(new TopicAndPartition(_)))
+      // Update the partition information to be the leader
+      partitionsTobeLeader.foreach{ case (partition, partitionStateInfo) =>
+        partition.makeLeader(controllerId, partitionStateInfo, correlationId, offsetManager)}
+
+    } catch {
+        // Re-throw the exception for it to be caught in KafkaApis
+        throw e
+    }
+    }
+  }
+```
+
+> makeLeaer
+
+```scala
+  /**
+   * Make the local replica the leader by resetting LogEndOffset for remote replicas (there could be old LogEndOffset from the time when this broker was the leader last time)
+   *  and setting the new leader and ISR
+   */
+  def makeLeader(controllerId: Int,
+                 partitionStateInfo: PartitionStateInfo, correlationId: Int,
+                 offsetManager: OffsetManager): Boolean = {
+    inWriteLock(leaderIsrUpdateLock) {
+      val allReplicas = partitionStateInfo.allReplicas
+      val leaderIsrAndControllerEpoch = partitionStateInfo.leaderIsrAndControllerEpoch
+      val leaderAndIsr = leaderIsrAndControllerEpoch.leaderAndIsr
+      // record the epoch of the controller that made the leadership decision. This is useful while updating the isr
+      // to maintain the decision maker controller's epoch in the zookeeper path
+      controllerEpoch = leaderIsrAndControllerEpoch.controllerEpoch
+      // add replicas that are new
+      // 生成 Assign Replicas 信息
+      allReplicas.foreach(replica => getOrCreateReplica(replica))
+      val newInSyncReplicas = leaderAndIsr.isr.map(r => getOrCreateReplica(r)).toSet
+      // remove assigned replicas that have been removed by the controller
+      (assignedReplicas().map(_.brokerId) -- allReplicas).foreach(removeReplica(_))
+      inSyncReplicas = newInSyncReplicas
+      leaderEpoch = leaderAndIsr.leaderEpoch
+      zkVersion = leaderAndIsr.zkVersion
+      leaderReplicaIdOpt = Some(localBrokerId)
+      // construct the high watermark metadata for the new leader replica
+      val newLeaderReplica = getReplica().get
+      newLeaderReplica.convertHWToLocalOffsetMetadata()
+      // reset log end offset for remote replicas
+      assignedReplicas.foreach(r => if (r.brokerId != localBrokerId) r.logEndOffset = LogOffsetMetadata.UnknownOffsetMetadata)
+      // we may need to increment high watermark since ISR could be down to 1
+      maybeIncrementLeaderHW(newLeaderReplica)
+      if (topic == OffsetManager.OffsetsTopicName)
+        offsetManager.loadOffsetsFromLog(partitionId)
+      true
+    }
+  }
+```
+
+> makeFollowers
+
+```scala
+  /*
+   * Make the current broker to become follower for a given set of partitions by:
+   *
+   * 1. Remove these partitions from the leader partitions set.
+   * 2. Mark the replicas as followers so that no more data can be added from the producer clients.
+   * 3. Stop fetchers for these partitions so that no more data can be added by the replica fetcher threads.
+   * 4. Truncate the log and checkpoint offsets for these partitions.
+   * 5. If the broker is not shutting down, add the fetcher to the new leaders.
+   *
+   * The ordering of doing these steps make sure that the replicas in transition will not
+   * take any more messages before checkpointing offsets so that all messages before the checkpoint
+   * are guaranteed to be flushed to disks
+   *
+   * If an unexpected error is thrown in this function, it will be propagated to KafkaApis where
+   * the error message will be set on each partition since we do not know which partition caused it
+   */
+  private def makeFollowers(controllerId: Int, epoch: Int, partitionState: Map[Partition, PartitionStateInfo],
+                            leaders: Set[Broker], correlationId: Int, responseMap: mutable.Map[(String, Int), Short],
+                            offsetManager: OffsetManager) {
+    for (partition <- partitionState.keys)
+      responseMap.put((partition.topic, partition.partitionId), ErrorMapping.NoError)
+
+    try {
+
+      var partitionsToMakeFollower: Set[Partition] = Set()
+
+      // TODO: Delete leaders from LeaderAndIsrRequest in 0.8.1
+      partitionState.foreach{ case (partition, partitionStateInfo) =>
+        val leaderIsrAndControllerEpoch = partitionStateInfo.leaderIsrAndControllerEpoch
+        val newLeaderBrokerId = leaderIsrAndControllerEpoch.leaderAndIsr.leader
+        leaders.find(_.id == newLeaderBrokerId) match {
+          // Only change partition state when the leader is available
+          case Some(leaderBroker) =>
+            if (partition.makeFollower(controllerId, partitionStateInfo, correlationId, offsetManager))
+              partitionsToMakeFollower += partition
+            else
+              stateChangeLogger.info("state change info")
+          case None =>
+            // The leader broker should always be present in the leaderAndIsrRequest.
+            // If not, we should record the error message and abort the transition process for this partition
+            stateChangeLogger.error(("Broker %d received LeaderAndIsrRequest with correlation id %d from controller" +
+              " %d epoch %d for partition [%s,%d] but cannot become follower since the new leader %d is unavailable.")
+              .format(localBrokerId, correlationId, controllerId, leaderIsrAndControllerEpoch.controllerEpoch,
+              partition.topic, partition.partitionId, newLeaderBrokerId))
+            // Create the local replica even if the leader is unavailable. This is required to ensure that we include
+            // the partition's high watermark in the checkpoint file (see KAFKA-1647)
+            partition.getOrCreateReplica()
+        }
+      }
+
+      // 停止旧的 ReplicaFetcherThread，因为 leader 可能发生了变化，可以看到在后面的代码中，我们通过
+      // replicaFetcherManager.addFetcherForPartitions 拉起了新的 ReplicaFetcherThread
+      replicaFetcherManager.removeFetcherForPartitions(partitionsToMakeFollower.map(new TopicAndPartition(_)))
+      // 为了保证数据一执行，需要将Replica的数据截断至 HighWatermark 处
+      logManager.truncateTo(partitionsToMakeFollower.map(partition => (new TopicAndPartition(partition), partition.getOrCreateReplica().highWatermark.messageOffset)).toMap)
+
+      if (isShuttingDown.get()) {
+        partitionsToMakeFollower.foreach { partition =>
+          stateChangeLogger.trace(("Broker %d skipped the adding-fetcher step of the become-follower state change with correlation id %d from " +
+            "controller %d epoch %d for partition [%s,%d] since it is shutting down").format(localBrokerId, correlationId,
+            controllerId, epoch, partition.topic, partition.partitionId))
+        }
+      }
+      else {
+        // we do not need to check if the leader exists again since this has been done at the beginning of this process
+        val partitionsToMakeFollowerWithLeaderAndOffset = partitionsToMakeFollower.map(partition =>
+          new TopicAndPartition(partition) -> BrokerAndInitialOffset(
+            leaders.find(_.id == partition.leaderReplicaIdOpt.get).get,
+            partition.getReplica().get.logEndOffset.messageOffset)).toMap
+        replicaFetcherManager.addFetcherForPartitions(partitionsToMakeFollowerWithLeaderAndOffset)
+      }
+    } catch {
+      case e: Throwable =>
+        throw e
+    }
+  }
+```
+
+> makeFollower
+
+```scala
+  /**
+   *  Make the local replica the follower by setting the new leader and ISR to empty
+   *  If the leader replica id does not change, return false to indicate the replica manager
+   */
+  def makeFollower(controllerId: Int,
+                   partitionStateInfo: PartitionStateInfo,
+                   correlationId: Int, offsetManager: OffsetManager): Boolean = {
+    inWriteLock(leaderIsrUpdateLock) {
+      val allReplicas = partitionStateInfo.allReplicas
+      val leaderIsrAndControllerEpoch = partitionStateInfo.leaderIsrAndControllerEpoch
+      val leaderAndIsr = leaderIsrAndControllerEpoch.leaderAndIsr
+      val newLeaderBrokerId: Int = leaderAndIsr.leader
+      // record the epoch of the controller that made the leadership decision. This is useful while updating the isr
+      // to maintain the decision maker controller's epoch in the zookeeper path
+      controllerEpoch = leaderIsrAndControllerEpoch.controllerEpoch
+      // add replicas that are new
+      allReplicas.foreach(r => getOrCreateReplica(r))
+      // remove assigned replicas that have been removed by the controller
+      (assignedReplicas().map(_.brokerId) -- allReplicas).foreach(removeReplica(_))
+      inSyncReplicas = Set.empty[Replica]
+      leaderEpoch = leaderAndIsr.leaderEpoch
+      zkVersion = leaderAndIsr.zkVersion
+
+      leaderReplicaIdOpt.foreach { leaderReplica =>
+        if (topic == OffsetManager.OffsetsTopicName &&
+           /* if we are making a leader->follower transition */
+           leaderReplica == localBrokerId)
+          offsetManager.clearOffsetsInPartition(partitionId)
+      }
+
+      if (leaderReplicaIdOpt.isDefined && leaderReplicaIdOpt.get == newLeaderBrokerId) {
+        false
+      }
+      else {
+        leaderReplicaIdOpt = Some(newLeaderBrokerId)
+        true
+      }
+    }
+  }
+```
+
+###### 4.3.2.2 stopReplicas
+
+```scala
+  def stopReplicas(stopReplicaRequest: StopReplicaRequest): (mutable.Map[TopicAndPartition, Short], Short) = {
+    replicaStateChangeLock synchronized {
+      val responseMap = new collection.mutable.HashMap[TopicAndPartition, Short]
+      if(stopReplicaRequest.controllerEpoch < controllerEpoch) {
+        (responseMap, ErrorMapping.StaleControllerEpochCode)
+      } else {
+        controllerEpoch = stopReplicaRequest.controllerEpoch
+        // First stop fetchers for all partitions, then stop the corresponding replicas
+        replicaFetcherManager.removeFetcherForPartitions(stopReplicaRequest.partitions.map(r => TopicAndPartition(r.topic, r.partition)))
+        // 再根据 deletePartitions 判断是否需要删除分区
+        for(topicAndPartition <- stopReplicaRequest.partitions){
+          val errorCode = stopReplica(topicAndPartition.topic, topicAndPartition.partition, stopReplicaRequest.deletePartitions)
+          responseMap.put(topicAndPartition, errorCode)
+        }
+        (responseMap, ErrorMapping.NoError)
+      }
+    }
+  }
+```
+
+###### 4.3.2.3 maybeShrinkIsr
+
+```scala
+  def maybeShrinkIsr(replicaMaxLagTimeMs: Long,  replicaMaxLagMessages: Long) {
+    inWriteLock(leaderIsrUpdateLock) {
+      // 如果是 leader 则删除那些没有同步的 ISR
+      leaderReplicaIfLocal() match {
+        case Some(leaderReplica) =>
+          val outOfSyncReplicas = getOutOfSyncReplicas(leaderReplica, replicaMaxLagTimeMs, replicaMaxLagMessages)
+          if(outOfSyncReplicas.size > 0) {
+            val newInSyncReplicas = inSyncReplicas -- outOfSyncReplicas
+            assert(newInSyncReplicas.size > 0)
+            info("Shrinking ISR for partition [%s,%d] from %s to %s".format(topic, partitionId,
+              inSyncReplicas.map(_.brokerId).mkString(","), newInSyncReplicas.map(_.brokerId).mkString(",")))
+            // update ISR in zk and in cache
+            updateIsr(newInSyncReplicas)
+            // we may need to increment high watermark since ISR could be down to 1
+            maybeIncrementLeaderHW(leaderReplica)
+            replicaManager.isrShrinkRate.mark()
+          }
+        case None => // do nothing if no longer leader
+      }
+    }
+  }
+```
+
+> 为了判断 Replica 是否正常，我们需要通过两个参数来确定
+>
+> - `replica.lag.time.max.ms` 规定了同步的最大时间间隔
+> - `replica.lag.max.messages` 规定了同步的最大 offset
+
+```scala
+  def getOutOfSyncReplicas(leaderReplica: Replica, keepInSyncTimeMs: Long, keepInSyncMessages: Long): Set[Replica] = {
+    /**
+     * there are two cases that need to be handled here -
+     * 1. Stuck followers: If the leo of the replica hasn't been updated for keepInSyncTimeMs ms,
+     *                     the follower is stuck and should be removed from the ISR
+     * 2. Slow followers: If the leo of the slowest follower is behind the leo of the leader by keepInSyncMessages, the
+     *                     follower is not catching up and should be removed from the ISR
+     **/
+    val leaderLogEndOffset = leaderReplica.logEndOffset
+    val candidateReplicas = inSyncReplicas - leaderReplica
+    // Case 1 above
+    val stuckReplicas = candidateReplicas.filter(r => (time.milliseconds - r.logEndOffsetUpdateTimeMs) > keepInSyncTimeMs)
+    if(stuckReplicas.nonEmpty)
+      debug("Stuck replicas for partition [%s,%d] are %s".format(topic, partitionId, stuckReplicas.map(_.brokerId).mkString(",")))
+    // Case 2 above
+    val slowReplicas = candidateReplicas.filter(r =>
+      r.logEndOffset.messageOffset >= 0 &&
+      leaderLogEndOffset.messageOffset - r.logEndOffset.messageOffset > keepInSyncMessages)
+    if(slowReplicas.nonEmpty)
+      debug("Slow replicas for partition [%s,%d] are %s".format(topic, partitionId, slowReplicas.map(_.brokerId).mkString(",")))
+    stuckReplicas ++ slowReplicas
+  }
+```
 
 
 

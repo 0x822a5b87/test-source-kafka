@@ -24,6 +24,12 @@ import kafka.common.KafkaException
 
 import java.util.concurrent.atomic.AtomicLong
 
+/**
+ * @param brokerId 所在的 broker ID
+ * @param partition 所在的分区
+ * @param initialHighWatermarkValue 初始的 HighWatermark
+ * @param log 对应的日志
+ */
 class Replica(val brokerId: Int,
               val partition: Partition,
               time: Time = SystemTime,

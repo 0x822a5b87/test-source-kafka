@@ -44,12 +44,14 @@ class Partition(val topic: String,
   private val localBrokerId = replicaManager.config.brokerId
   private val logManager = replicaManager.logManager
   private val zkClient = replicaManager.zkClient
+  // AR
   private val assignedReplicaMap = new Pool[Int, Replica]
   // The read lock is only required when multiple reads are executed and needs to be in a consistent manner
   private val leaderIsrUpdateLock = new ReentrantReadWriteLock()
   private var zkVersion: Int = LeaderAndIsr.initialZKVersion
   @volatile private var leaderEpoch: Int = LeaderAndIsr.initialLeaderEpoch - 1
   @volatile var leaderReplicaIdOpt: Option[Int] = None
+  // ISR
   @volatile var inSyncReplicas: Set[Replica] = Set.empty[Replica]
   /* Epoch of the controller that last changed the leader. This needs to be initialized correctly upon broker startup.
    * One way of doing that is through the controller's start replica state change command. When a new broker starts up
@@ -168,6 +170,7 @@ class Partition(val topic: String,
       // to maintain the decision maker controller's epoch in the zookeeper path
       controllerEpoch = leaderIsrAndControllerEpoch.controllerEpoch
       // add replicas that are new
+      // 生成 Assign Replicas 信息
       allReplicas.foreach(replica => getOrCreateReplica(replica))
       val newInSyncReplicas = leaderAndIsr.isr.map(r => getOrCreateReplica(r)).toSet
       // remove assigned replicas that have been removed by the controller
@@ -319,6 +322,7 @@ class Partition(val topic: String,
 
   def maybeShrinkIsr(replicaMaxLagTimeMs: Long,  replicaMaxLagMessages: Long) {
     inWriteLock(leaderIsrUpdateLock) {
+      // 如果是 leader 则删除那些没有同步的 ISR
       leaderReplicaIfLocal() match {
         case Some(leaderReplica) =>
           val outOfSyncReplicas = getOutOfSyncReplicas(leaderReplica, replicaMaxLagTimeMs, replicaMaxLagMessages)
@@ -350,13 +354,13 @@ class Partition(val topic: String,
     val candidateReplicas = inSyncReplicas - leaderReplica
     // Case 1 above
     val stuckReplicas = candidateReplicas.filter(r => (time.milliseconds - r.logEndOffsetUpdateTimeMs) > keepInSyncTimeMs)
-    if(stuckReplicas.size > 0)
+    if(stuckReplicas.nonEmpty)
       debug("Stuck replicas for partition [%s,%d] are %s".format(topic, partitionId, stuckReplicas.map(_.brokerId).mkString(",")))
     // Case 2 above
     val slowReplicas = candidateReplicas.filter(r =>
       r.logEndOffset.messageOffset >= 0 &&
       leaderLogEndOffset.messageOffset - r.logEndOffset.messageOffset > keepInSyncMessages)
-    if(slowReplicas.size > 0)
+    if(slowReplicas.nonEmpty)
       debug("Slow replicas for partition [%s,%d] are %s".format(topic, partitionId, slowReplicas.map(_.brokerId).mkString(",")))
     stuckReplicas ++ slowReplicas
   }
