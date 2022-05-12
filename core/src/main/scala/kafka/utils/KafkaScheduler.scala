@@ -72,8 +72,10 @@ class KafkaScheduler(val threads: Int,
       if(executor != null)
         throw new IllegalStateException("This scheduler has already been started!")
       executor = new ScheduledThreadPoolExecutor(threads)
+      // 退出时取消所有超时任务，包括正在执行和等待的
       executor.setContinueExistingPeriodicTasksAfterShutdownPolicy(false)
       executor.setExecuteExistingDelayedTasksAfterShutdownPolicy(false)
+      // 现场工厂类
       executor.setThreadFactory(new ThreadFactory() {
                                   def newThread(runnable: Runnable): Thread = 
                                     Utils.newThread(threadNamePrefix + schedulerThreadId.getAndIncrement(), runnable, daemon)
@@ -93,9 +95,10 @@ class KafkaScheduler(val threads: Int,
     debug("Scheduling task %s with initial delay %d ms and period %d ms."
         .format(name, TimeUnit.MILLISECONDS.convert(delay, unit), TimeUnit.MILLISECONDS.convert(period, unit)))
     ensureStarted
+    // 生成线程任务
     val runnable = Utils.runnable {
       try {
-        trace("Begining execution of scheduled task '%s'.".format(name))
+        trace("Beginning execution of scheduled task '%s'.".format(name))
         fun()
       } catch {
         case t: Throwable => error("Uncaught exception in scheduled task '" + name +"'", t)

@@ -1454,6 +1454,65 @@ class OffsetManager(val config: OffsetManagerConfig,
 
 #### 4.3.4 KafkaScheduler
 
+```scala
+/**
+ * A scheduler based on java.util.concurrent.ScheduledThreadPoolExecutor
+ * 
+ * It has a pool of kafka-scheduler- threads that do the actual work.
+ * 
+ * @param threads The number of threads in the thread pool
+ * @param threadNamePrefix The name to use for scheduler threads. This prefix will have a number appended to it.
+ * @param daemon If true the scheduler threads will be "daemon" threads and will not block jvm shutdown.
+ */
+@threadsafe
+class KafkaScheduler(val threads: Int, 
+                     val threadNamePrefix: String = "kafka-scheduler-", 
+                     daemon: Boolean = true) extends Scheduler with Logging {
+  @volatile private var executor: ScheduledThreadPoolExecutor = null
+  private val schedulerThreadId = new AtomicInteger(0)
+  
+  override def startup() {
+    debug("Initializing task scheduler.")
+    this synchronized {
+      if(executor != null)
+        throw new IllegalStateException("This scheduler has already been started!")
+      executor = new ScheduledThreadPoolExecutor(threads)
+      // 退出时取消所有超时任务，包括正在执行和等待的
+      executor.setContinueExistingPeriodicTasksAfterShutdownPolicy(false)
+      executor.setExecuteExistingDelayedTasksAfterShutdownPolicy(false)
+      // 现场工厂类
+      executor.setThreadFactory(new ThreadFactory() {
+                                  def newThread(runnable: Runnable): Thread = 
+                                    Utils.newThread(threadNamePrefix + schedulerThreadId.getAndIncrement(), runnable, daemon)
+                                })
+    }
+  }
+}
+```
+
+```scala
+  def schedule(name: String, fun: ()=>Unit, delay: Long, period: Long, unit: TimeUnit) = {
+    debug("Scheduling task %s with initial delay %d ms and period %d ms."
+        .format(name, TimeUnit.MILLISECONDS.convert(delay, unit), TimeUnit.MILLISECONDS.convert(period, unit)))
+    ensureStarted
+    // 生成线程任务
+    val runnable = Utils.runnable {
+      try {
+        trace("Beginning execution of scheduled task '%s'.".format(name))
+        fun()
+      } catch {
+        case t: Throwable => error("Uncaught exception in scheduled task '" + name +"'", t)
+      } finally {
+        trace("Completed execution of scheduled task '%s'.".format(name))
+      }
+    }
+    if(period >= 0)
+      executor.scheduleAtFixedRate(runnable, delay, period, unit)
+    else
+      executor.schedule(runnable, delay, unit)
+  }
+```
+
 
 
 
