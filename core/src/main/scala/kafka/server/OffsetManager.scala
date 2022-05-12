@@ -116,6 +116,7 @@ class OffsetManager(val config: OffsetManagerConfig,
     debug("Compacting offsets cache.")
     val startMs = SystemTime.milliseconds
 
+    // 筛选出过期的 offset
     val staleOffsets = offsetsCache.filter(startMs - _._2.timestamp > config.offsetsRetentionMs)
 
     debug("Found %d stale offsets (older than %d ms).".format(staleOffsets.size, config.offsetsRetentionMs))
@@ -208,6 +209,7 @@ class OffsetManager(val config: OffsetManagerConfig,
   def getOffsets(group: String, topicPartitions: Seq[TopicAndPartition]): Map[TopicAndPartition, OffsetMetadataAndError] = {
     trace("Getting offsets %s for group %s.".format(topicPartitions, group))
 
+    // 查找 group 位于 __consumer_offsets 的分区
     val offsetsPartition = partitionFor(group)
 
     /**
@@ -216,7 +218,9 @@ class OffsetManager(val config: OffsetManagerConfig,
      * the check and clear the cache. i.e., we would read from the empty cache and incorrectly return NoOffset.
      */
     followerTransitionLock synchronized {
+      // 只有 partition 为 leader 所在的 broker server 提供查询服务
       if (leaderIsLocal(offsetsPartition)) {
+        // 如果目标partition正在加载则无法获取其偏移量。仅仅会发生在broker server启动期间，因为需要从指定的主分区加载数据
         if (loadingPartitions synchronized loadingPartitions.contains(offsetsPartition)) {
           debug("Cannot fetch offsets for group %s due to ongoing offset load.".format(group))
           topicPartitions.map { topicAndPartition =>
@@ -224,12 +228,13 @@ class OffsetManager(val config: OffsetManagerConfig,
             (groupTopicPartition.topicPartition, OffsetMetadataAndError.OffsetsLoading)
           }.toMap
         } else {
-          if (topicPartitions.size == 0) {
+          if (topicPartitions.isEmpty) {
            // Return offsets for all partitions owned by this consumer group. (this only applies to consumers that commit offsets to Kafka.)
             offsetsCache.filter(_._1.group == group).map { case(groupTopicPartition, offsetAndMetadata) =>
               (groupTopicPartition.topicPartition, OffsetMetadataAndError(offsetAndMetadata.offset, offsetAndMetadata.metadata, ErrorMapping.NoError))
             }.toMap
           } else {
+            // 从 cache 中获取指定的 group 和 partition 的 offset
             topicPartitions.map { topicAndPartition =>
               val groupTopicPartition = GroupTopicPartition(group, topicAndPartition)
               (groupTopicPartition.topicPartition, getOffset(groupTopicPartition))
@@ -237,6 +242,7 @@ class OffsetManager(val config: OffsetManagerConfig,
           }
         }
       } else {
+        // 非 leader，不提供服务
         debug("Could not fetch offsets for group %s (not offset coordinator).".format(group))
         topicPartitions.map { topicAndPartition =>
           val groupTopicPartition = GroupTopicPartition(group, topicAndPartition)

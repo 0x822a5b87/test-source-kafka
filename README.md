@@ -929,7 +929,7 @@ class LogManager(val logDirs: Array[File],
 >
 > 简单来说，在 `AbstractFetcherThread` 中保存了 `partitionMap`，同时有一个线程一直通过读取 `partitionMap` 并组装 `FetchRequest` 向 `leader` 请求数据。
 
-###### HighWatermark、LogEndOffset
+##### HighWatermark、LogEndOffset
 
 > kafka 的日志包含了两个不同的偏移量，分别是 `HighWatemark` 和 `LogEndOffset`；
 >
@@ -946,7 +946,7 @@ class LogManager(val logDirs: Array[File],
   @volatile private[this] var logEndOffsetMetadata: LogOffsetMetadata = LogOffsetMetadata.UnknownOffsetMetadata
 ```
 
-###### Partition
+##### Partition
 
 > `controllerEpoch` 会在 `makeFollower` 和 `makeLeader` 中被修改，这意味着在某一个时刻，针对于某个 `epoch` 的投票达成了一致。
 
@@ -977,7 +977,7 @@ class Partition(val topic: String,
 }
 ```
 
-###### Replica
+##### Replica
 
 ```scala
 /**
@@ -1005,7 +1005,7 @@ class Replica(val brokerId: Int,
 }
 ```
 
-###### processPartitionData
+##### processPartitionData
 
 ```scala
   /**
@@ -1051,7 +1051,7 @@ class Replica(val brokerId: Int,
   }
 ```
 
-###### 4.3.2.1 becomeLeaderOrFollower
+##### 4.3.2.1 becomeLeaderOrFollower
 
 ```scala
   /**
@@ -1339,7 +1339,7 @@ class Replica(val brokerId: Int,
   }
 ```
 
-###### 4.3.2.2 stopReplicas
+##### 4.3.2.2 stopReplicas
 
 ```scala
   def stopReplicas(stopReplicaRequest: StopReplicaRequest): (mutable.Map[TopicAndPartition, Short], Short) = {
@@ -1362,7 +1362,7 @@ class Replica(val brokerId: Int,
   }
 ```
 
-###### 4.3.2.3 maybeShrinkIsr
+##### 4.3.2.3 maybeShrinkIsr
 
 ```scala
   def maybeShrinkIsr(replicaMaxLagTimeMs: Long,  replicaMaxLagMessages: Long) {
@@ -1417,6 +1417,72 @@ class Replica(val brokerId: Int,
     stuckReplicas ++ slowReplicas
   }
 ```
+
+#### 4.3.3 OffsetManager
+
+##### 涉及到的类
+
+> OffsetManager 主要提供以下功能：
+>
+> 1. 缓存最新的偏移量（注意关键词，**缓存**，**最新**），缓存在 `offsetsCache` 中；
+> 2. 提供偏移量的查询；
+> 3. Compact，保留最新的偏移量以控制 `__consumer_offset` 的大小。
+
+> - OffsetManagerConfig
+> - GroupTopicPartition
+> - OffsetAndMetadata
+
+```scala
+class OffsetManager(val config: OffsetManagerConfig,
+                    replicaManager: ReplicaManager,
+                    zkClient: ZkClient,
+                    scheduler: Scheduler) extends Logging with KafkaMetricsGroup {
+
+  /* offsets and metadata cache */
+  private val offsetsCache = new Pool[GroupTopicPartition, OffsetAndMetadata]
+  private val followerTransitionLock = new Object
+
+  private val loadingPartitions: mutable.Set[Int] = mutable.Set()
+
+  scheduler.schedule(name = "offsets-cache-compactor",
+                     fun = compact,
+                     period = config.offsetsRetentionCheckIntervalMs,
+                     unit = TimeUnit.MILLISECONDS)
+
+}
+```
+
+#### 4.3.4 KafkaScheduler
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
