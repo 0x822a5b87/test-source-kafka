@@ -557,16 +557,26 @@ class KafkaApis(val requestChannel: RequestChannel,
   }
 
   private def getTopicMetadata(topics: Set[String]): Seq[TopicMetadata] = {
+    // 从 metadataCache 中获取 topic metadata
     val topicResponses = metadataCache.getTopicMetadata(topics)
-    if (topics.size > 0 && topicResponses.size != topics.size) {
+    // 如果请求的 topic 列表不为空，并且响应的 metadata size 与请求的topic列表长度不同
+    // 说明有一部分数据是没有存放在 metadataCache 中的
+    // 因为我们 metadataCache.getTopicMetadata(topics) 只会请求部分 topics
+    // 所以一定是数据没有存在 metadataCache 中
+    if (topics.nonEmpty && topicResponses.size != topics.size) {
+      // 找到 cache 中不存在的 topic 列表
       val nonExistentTopics = topics -- topicResponses.map(_.topic).toSet
+      // 为 cache 中不存在的 topic 列表生成 metadata
       val responsesForNonExistentTopics = nonExistentTopics.map { topic =>
+        // 如果是 kafka 内部用于记录 offset 的 topic，或者自动创建 topic 打开了
         if (topic == OffsetManager.OffsetsTopicName || config.autoCreateTopicsEnable) {
           try {
+            // 创建 OffsetsTopicName 对应的 topic
             if (topic == OffsetManager.OffsetsTopicName) {
               val aliveBrokers = metadataCache.getAliveBrokers
+              // 指定副本数为配置的副本数与在线brokers的最小值
               val offsetsTopicReplicationFactor =
-                if (aliveBrokers.length > 0)
+                if (aliveBrokers.nonEmpty)
                   Math.min(config.offsetsTopicReplicationFactor, aliveBrokers.length)
                 else
                   config.offsetsTopicReplicationFactor
@@ -577,6 +587,7 @@ class KafkaApis(val requestChannel: RequestChannel,
                 .format(topic, config.offsetsTopicPartitions, offsetsTopicReplicationFactor))
             }
             else {
+              // 创建 topic
               AdminUtils.createTopic(zkClient, topic, config.numPartitions, config.defaultReplicationFactor)
               info("Auto creation of topic %s with %d partitions and replication factor %d is successful!"
                    .format(topic, config.numPartitions, config.defaultReplicationFactor))
@@ -597,9 +608,11 @@ class KafkaApis(val requestChannel: RequestChannel,
   /**
    * Service the topic metadata request API
    */
-  def handleTopicMetadataRequest(request: RequestChannel.Request) {
+  def handleTopicMetadataRequest(request: RequestChannel.Request): Unit = {
     val metadataRequest = request.requestObj.asInstanceOf[TopicMetadataRequest]
+    // 获取 topic metadata
     val topicMetadata = getTopicMetadata(metadataRequest.topics.toSet)
+    // 获取在线的broker列表
     val brokers = metadataCache.getAliveBrokers
     trace("Sending topic metadata %s and brokers %s for correlation id %d to client %s".format(topicMetadata.mkString(","), brokers.mkString(","), metadataRequest.correlationId, metadataRequest.clientId))
     val response = new TopicMetadataResponse(brokers, topicMetadata, metadataRequest.correlationId)

@@ -56,6 +56,40 @@
 
 > 一个 <TopicAndPartition> 对应一个 offset 没问题，但是实际上，我们的 Log 由多个 LogSegment 构成，我们在消费的时候，可能是指定了 **auto.offset.reset == ealiest**，那么我们可能需要从最早的 LogSegment 开始消费数据。
 
+### `KafkaApis#metadataCache` 有什么用？
+
+> `KafkaApis#metadataCache` 缓存了 **kafka topic 的 metadata 以及 aliveBrokers** 相关信息，**它接收从 controller 发来的 `UpdateMetadataRequest` 来更新本地缓存信息。**
+>
+> ```scala
+> private[server] class MetadataCache {
+>   private val cache: mutable.Map[String, mutable.Map[Int, PartitionStateInfo]] = new mutable.HashMap[String, mutable.Map[Int, PartitionStateInfo]]()
+>   private var aliveBrokers: Map[Int, Broker] = Map()
+>   
+>   // 同时提供了 updateCache 方法更新缓存
+>   def updateCache(updateMetadataRequest: UpdateMetadataRequest,
+>                   brokerId: Int,
+>                   stateChangeLogger: StateChangeLogger): Unit = {
+> 
+>     inWriteLock(partitionMetadataLock) {
+>       // 根据 controller 发送的 <UpdateMetadataRequest> 来更新存活的 brokers
+>       aliveBrokers = updateMetadataRequest.aliveBrokers.map(b => (b.id, b)).toMap
+>       // 根据 controller 发送的 <UpdateMetadataRequest> 来更新 partition 状态信息
+>       updateMetadataRequest.partitionStateInfos.foreach { case(tp, info) =>
+>         if (info.leaderIsrAndControllerEpoch.leaderAndIsr.leader == LeaderAndIsr.LeaderDuringDelete) {
+>           removePartitionInfo(tp.topic, tp.partition)
+>         } else {
+>           addOrUpdatePartitionInfo(tp.topic, tp.partition, info)
+>         }
+>       }
+>     }
+>   }
+> }
+> ```
+>
+> 调用链为
+>
+> > `controler 发送 UpdateMetadataRequest` -> `kafkaApis#handleUpdateMetadataRequest` -> `maybeUpdateMetadataCache#maybeUpdateMetadataCache` -> `MetadataCache#updateCache`
+
 ## 编译
 
 ### MavenDeployment
@@ -1943,7 +1977,145 @@ class KafkaApis(val requestChannel: RequestChannel,
 >
 > **topic信息包括了分区索引，Leader Replica，AR 以及 ISR。**
 
+```scala
+  /**
+   * Service the topic metadata request API
+   */
+  def handleTopicMetadataRequest(request: RequestChannel.Request): Unit = {
+    val metadataRequest = request.requestObj.asInstanceOf[TopicMetadataRequest]
+    // 获取 topic metadata
+    val topicMetadata = getTopicMetadata(metadataRequest.topics.toSet)
+    // 获取在线的broker列表
+    val brokers = metadataCache.getAliveBrokers
+    trace("Sending topic metadata %s and brokers %s for correlation id %d to client %s".format(topicMetadata.mkString(","), brokers.mkString(","), metadataRequest.correlationId, metadataRequest.clientId))
+    val response = new TopicMetadataResponse(brokers, topicMetadata, metadataRequest.correlationId)
+    requestChannel.sendResponse(new RequestChannel.Response(request, new BoundedByteBufferSend(response)))
+  }
+```
 
+###### 获取 topic metadata
+
+> `KafkaApis#getTopicMetadata`
+
+```scala
+  private def getTopicMetadata(topics: Set[String]): Seq[TopicMetadata] = {
+    // 从 metadataCache 中获取 topic metadata
+    val topicResponses = metadataCache.getTopicMetadata(topics)
+    // 如果请求的 topic 列表不为空，并且响应的 metadata size 与请求的topic列表长度不同
+    // 说明有一部分数据是没有存放在 metadataCache 中的
+    // 因为我们 metadataCache.getTopicMetadata(topics) 只会请求部分 topics
+    // 所以一定是数据没有存在 metadataCache 中
+    if (topics.nonEmpty && topicResponses.size != topics.size) {
+      // 找到 cache 中不存在的 topic 列表
+      val nonExistentTopics = topics -- topicResponses.map(_.topic).toSet
+      // 为 cache 中不存在的 topic 列表生成 metadata
+      val responsesForNonExistentTopics = nonExistentTopics.map { topic =>
+        // 如果是 kafka 内部用于记录 offset 的 topic，或者自动创建 topic 打开了
+        if (topic == OffsetManager.OffsetsTopicName || config.autoCreateTopicsEnable) {
+          try {
+            // 创建 OffsetsTopicName 对应的 topic
+            if (topic == OffsetManager.OffsetsTopicName) {
+              val aliveBrokers = metadataCache.getAliveBrokers
+              // 指定副本数为配置的副本数与在线brokers的最小值
+              val offsetsTopicReplicationFactor =
+                if (aliveBrokers.nonEmpty)
+                  Math.min(config.offsetsTopicReplicationFactor, aliveBrokers.length)
+                else
+                  config.offsetsTopicReplicationFactor
+              AdminUtils.createTopic(zkClient, topic, config.offsetsTopicPartitions,
+                                     offsetsTopicReplicationFactor,
+                                     offsetManager.offsetsTopicConfig)
+              info("Auto creation of topic %s with %d partitions and replication factor %d is successful!"
+                .format(topic, config.offsetsTopicPartitions, offsetsTopicReplicationFactor))
+            }
+            else {
+              // 创建 topic
+              AdminUtils.createTopic(zkClient, topic, config.numPartitions, config.defaultReplicationFactor)
+              info("Auto creation of topic %s with %d partitions and replication factor %d is successful!"
+                   .format(topic, config.numPartitions, config.defaultReplicationFactor))
+            }
+          } catch {
+            case e: TopicExistsException => // let it go, possibly another broker created this topic
+          }
+          new TopicMetadata(topic, Seq.empty[PartitionMetadata], ErrorMapping.LeaderNotAvailableCode)
+        } else {
+          new TopicMetadata(topic, Seq.empty[PartitionMetadata], ErrorMapping.UnknownTopicOrPartitionCode)
+        }
+      }
+      topicResponses.appendAll(responsesForNonExistentTopics)
+    }
+    topicResponses
+  }
+```
+
+> `MetadataCache#getTopicMetadata`：在本函数中，我们通过 `cache` 查询了所有当前缓存的 `Map[Int, PartitionStateInfo]`，此时我们通过缓存查到 `allBrokers` 中 **查询每一个 Partition 对应的 leader 的 Broker，每一个 Partition 的ISR 对应的 Broker，每一个 Partition 的 AR 对应的 Broker 相关的信息**，并且在缓存数据和实际的数据不符合时抛出相应异常。
+
+```scala
+  def getTopicMetadata(topics: Set[String]): mutable.Seq[TopicMetadata] = {
+    // 如果 topics 为空，则返回所有的 topic 信息
+    val isAllTopics = topics.isEmpty
+    val topicsRequested = if(isAllTopics) cache.keySet else topics
+
+    val topicResponses: mutable.ListBuffer[TopicMetadata] = new mutable.ListBuffer[TopicMetadata]
+    inReadLock(partitionMetadataLock) {
+      for (topic <- topicsRequested) {
+        if (isAllTopics || cache.contains(topic)) {
+          // 获取 topic 的所有 partition 信息， Map[Int, PartitionStateInfo]
+          val partitionStateInfos = cache(topic)
+          val partitionMetadata = partitionStateInfos.map {
+            // 现在我们进入了某一个 topic 的某一个分区相关的逻辑
+            case (partitionId, partitionState) =>
+              // 获取所有的副本ID： Set[Int]
+              val replicas = partitionState.allReplicas
+              // 从在线的brokers中获取所有的副本ID对应的broker
+              // 此时，我们已经拿到了我们需要访问的topics列表的所有副本所在的broker
+              // 比如，假设我们请求 test 的 metadata，并且 test 只在 brokerId == 1 和 brokerId == 2 的 broker 上
+              // 那现在 replicaInfo 就包含了 broker1 以及 broker2
+              val replicaInfo: Seq[Broker] = replicas.map(replicaId => aliveBrokers.getOrElse(replicaId, null)).filter(_ != null).toSeq
+              var leaderInfo: Option[Broker] = None
+              var isrInfo: Seq[Broker] = Nil
+              // cache 里缓存了 broker 的 leader，isr 相关的信息
+              val leaderIsrAndEpoch = partitionState.leaderIsrAndControllerEpoch
+              val leader = leaderIsrAndEpoch.leaderAndIsr.leader
+              val isr = leaderIsrAndEpoch.leaderAndIsr.isr
+              val topicPartition = TopicAndPartition(topic, partitionId)
+              try {
+                // 从在线的broker中获取当前的 [topic, partition] 的leader broker
+                leaderInfo = aliveBrokers.get(leader)
+                if (leaderInfo.isEmpty)
+                  throw new LeaderNotAvailableException("Leader not available for %s".format(topicPartition))
+                isrInfo = isr.map(aliveBrokers.getOrElse(_, null)).filter(_ != null)
+                // 如果从在线的broker拿到的实际replica大小与cache中缓存的replica大小不同，则说明可能有broker不可用
+                if (replicaInfo.size < replicas.size)
+                  throw new ReplicaNotAvailableException("Replica information not available for following brokers: " +
+                    replicas.filterNot(replicaInfo.map(_.id).contains(_)).mkString(","))
+                // 如果从在线的broker中拿到isr信息与cache的isr信息不符，说明有isr不可用
+                if (isrInfo.size < isr.size)
+                  throw new ReplicaNotAvailableException("In Sync Replica information not available for following brokers: " +
+                    isr.filterNot(isrInfo.map(_.id).contains(_)).mkString(","))
+                new PartitionMetadata(partitionId, leaderInfo, replicaInfo, isrInfo, ErrorMapping.NoError)
+              } catch {
+                case e: Throwable =>
+                  debug("Error while fetching metadata for %s. Possible cause: %s".format(topicPartition, e.getMessage))
+                  new PartitionMetadata(partitionId, leaderInfo, replicaInfo, isrInfo,
+                    ErrorMapping.codeFor(e.getClass.asInstanceOf[Class[Throwable]]))
+              }
+          }
+          topicResponses += new TopicMetadata(topic, partitionMetadata.toSeq)
+        }
+      }
+    }
+    topicResponses
+  }
+```
+
+##### 4.3.5.5 LeaderAndIsrRequest
+
+> `LeaderAndIsrRequest`  
+>
+> 1. 当 broker 发生宕机时，在本台 broker 上的leader replica会发生 leader 切换，follower replica 也需要从 ISR 中删除；
+> 2. ISR 由于长时间未上报心跳，或者说与leader的延迟较大也会触发此请求；
+> 3. 手动指定replica分布；
 
 
 

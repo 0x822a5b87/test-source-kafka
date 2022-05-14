@@ -37,31 +37,44 @@ private[server] class MetadataCache {
   private val partitionMetadataLock = new ReentrantReadWriteLock()
 
   def getTopicMetadata(topics: Set[String]) = {
+    // 如果 topics 为空，则返回所有的 topic 信息
     val isAllTopics = topics.isEmpty
     val topicsRequested = if(isAllTopics) cache.keySet else topics
+
     val topicResponses: mutable.ListBuffer[TopicMetadata] = new mutable.ListBuffer[TopicMetadata]
     inReadLock(partitionMetadataLock) {
       for (topic <- topicsRequested) {
         if (isAllTopics || cache.contains(topic)) {
+          // 获取 topic 的所有 partition 信息， Map[Int, PartitionStateInfo]
           val partitionStateInfos = cache(topic)
           val partitionMetadata = partitionStateInfos.map {
+            // 现在我们进入了某一个 topic 的某一个分区相关的逻辑
             case (partitionId, partitionState) =>
+              // 获取所有的副本ID： Set[Int]
               val replicas = partitionState.allReplicas
-              val replicaInfo: Seq[Broker] = replicas.map(aliveBrokers.getOrElse(_, null)).filter(_ != null).toSeq
+              // 从在线的brokers中获取所有的副本ID对应的broker
+              // 此时，我们已经拿到了我们需要访问的topics列表的所有副本所在的broker
+              // 比如，假设我们请求 test 的 metadata，并且 test 只在 brokerId == 1 和 brokerId == 2 的 broker 上
+              // 那现在 replicaInfo 就包含了 broker1 以及 broker2
+              val replicaInfo: Seq[Broker] = replicas.map(replicaId => aliveBrokers.getOrElse(replicaId, null)).filter(_ != null).toSeq
               var leaderInfo: Option[Broker] = None
               var isrInfo: Seq[Broker] = Nil
+              // cache 里缓存了 broker 的 leader，isr 相关的信息
               val leaderIsrAndEpoch = partitionState.leaderIsrAndControllerEpoch
               val leader = leaderIsrAndEpoch.leaderAndIsr.leader
               val isr = leaderIsrAndEpoch.leaderAndIsr.isr
               val topicPartition = TopicAndPartition(topic, partitionId)
               try {
+                // 从在线的broker中获取当前的 [topic, partition] 的leader broker
                 leaderInfo = aliveBrokers.get(leader)
-                if (!leaderInfo.isDefined)
+                if (leaderInfo.isEmpty)
                   throw new LeaderNotAvailableException("Leader not available for %s".format(topicPartition))
                 isrInfo = isr.map(aliveBrokers.getOrElse(_, null)).filter(_ != null)
+                // 如果从在线的broker拿到的实际replica大小与cache中缓存的replica大小不同，则说明可能有broker不可用
                 if (replicaInfo.size < replicas.size)
                   throw new ReplicaNotAvailableException("Replica information not available for following brokers: " +
                     replicas.filterNot(replicaInfo.map(_.id).contains(_)).mkString(","))
+                // 如果从在线的broker中拿到isr信息与cache的isr信息不符，说明有isr不可用
                 if (isrInfo.size < isr.size)
                   throw new ReplicaNotAvailableException("In Sync Replica information not available for following brokers: " +
                     isr.filterNot(isrInfo.map(_.id).contains(_)).mkString(","))
@@ -112,22 +125,17 @@ private[server] class MetadataCache {
 
   def updateCache(updateMetadataRequest: UpdateMetadataRequest,
                   brokerId: Int,
-                  stateChangeLogger: StateChangeLogger) {
+                  stateChangeLogger: StateChangeLogger): Unit = {
+
     inWriteLock(partitionMetadataLock) {
+      // 根据 controller 发送的 <UpdateMetadataRequest> 来更新存活的 brokers
       aliveBrokers = updateMetadataRequest.aliveBrokers.map(b => (b.id, b)).toMap
+      // 根据 controller 发送的 <UpdateMetadataRequest> 来更新 partition 状态信息
       updateMetadataRequest.partitionStateInfos.foreach { case(tp, info) =>
         if (info.leaderIsrAndControllerEpoch.leaderAndIsr.leader == LeaderAndIsr.LeaderDuringDelete) {
           removePartitionInfo(tp.topic, tp.partition)
-          stateChangeLogger.trace(("Broker %d deleted partition %s from metadata cache in response to UpdateMetadata request " +
-            "sent by controller %d epoch %d with correlation id %d")
-            .format(brokerId, tp, updateMetadataRequest.controllerId,
-            updateMetadataRequest.controllerEpoch, updateMetadataRequest.correlationId))
         } else {
           addOrUpdatePartitionInfo(tp.topic, tp.partition, info)
-          stateChangeLogger.trace(("Broker %d cached leader info %s for partition %s in response to UpdateMetadata request " +
-            "sent by controller %d epoch %d with correlation id %d")
-            .format(brokerId, info, tp, updateMetadataRequest.controllerId,
-            updateMetadataRequest.controllerEpoch, updateMetadataRequest.correlationId))
         }
       }
     }
