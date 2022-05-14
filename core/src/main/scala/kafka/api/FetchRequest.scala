@@ -206,7 +206,7 @@ class FetchRequestBuilder() {
     this
   }
 
-  def build() = {
+  def build(): FetchRequest = {
     val fetchRequest = FetchRequest(versionId, correlationId.getAndIncrement, clientId, replicaId, maxWait, minBytes, requestMap.toMap)
     requestMap.clear()
     fetchRequest

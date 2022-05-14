@@ -17,9 +17,9 @@
 
 package kafka.javaapi
 
-import java.nio.ByteBuffer
+import kafka.api.{PartitionFetchInfo, Request}
 import kafka.common.TopicAndPartition
-import kafka.api.{Request, PartitionFetchInfo}
+
 import scala.collection.mutable
 
 class FetchRequest(correlationId: Int,

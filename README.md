@@ -14,6 +14,28 @@
 
 > 为什么 LogManager 在读数据的时候，需要有一个 `maxOffset` 指定可以拉取的最大偏移数？
 
+### 为什么每次提交 FetchRequest 时都需要带上自己的 offset
+
+> 在我们 `AbstractFetcherThread#doWork()` 方法中，我们定期的读取 `partitionMap` 中保存的 `<TopicAndPartition> -> offset` 的值，并构建一个 `FetchRequest` 发送到服务端。
+>
+> 而 `partitionMap` 只会在以下几个情况下更新：
+>
+> 1. `AbstractFetcherThread#processFetchRequest` 方法中，当 FetchRequest 请求得到一个 `FetchResponse` 时，会使用 `FetchResponse` 得到的数据的 offset 来更新；
+> 2. `AbstractFetcherThread#processFetchRequest` 方法中，在出现 `ErrorMapping.OffsetOutOfRangeCode` 异常时，更新；
+> 3. `AbstractFetcherThread#addPartitions` 方法中，在 partition 初始化时更新；
+>
+> 那么现在 `partitionMap` 保留了每个 replica 的 `LogEndOffset`，之后我们在下一次 `FetchRequest` 的时候，将新的 offset 提交上去，这样 leader 就可以使用所有副本上报的 offset 来确定当前的 `HighWatermark` 了。
+
+### 更新 offset 在数据持久化之前，怎么保证上报的 offset 是已经持久化的呢
+
+>  `AbstractFetcherThread#doWork()` -> `AbstractFetcherThread#processFetchRequest()` ->`ReplicaFetcherThread#processPartitionData`  
+>
+> 实际的调用顺序如上，他们是在单线程中的，所以不用担心会上报未持久化的 offset。
+
+### correlationId 的作用是什么？
+
+> `correlationId` 是 int32 类型，由客户端在向服务端发送请求的时候标识的请求ID，服务端在处理完请求之后会将 `correlationId` 放置在 `Response` 中，这样客户端可以把自己发送的 `Request` 还有服务端的 `Response` 关联起来。
+
 ## 编译
 
 ### MavenDeployment
@@ -1513,11 +1535,260 @@ class KafkaScheduler(val threads: Int,
   }
 ```
 
+#### 4.3.5 KafkaApis
 
+```scala
+/**
+ * Logic to handle the various Kafka requests
+ */
+class KafkaApis(val requestChannel: RequestChannel,
+                val replicaManager: ReplicaManager,
+                val offsetManager: OffsetManager,
+                val zkClient: ZkClient,
+                val brokerId: Int,
+                val config: KafkaConfig,
+                val controller: KafkaController) extends Logging {
 
+  /**
+   * Top-level method that handles all requests and multiplexes to the right api
+   */
+  def handle(request: RequestChannel.Request) {
+    try{
+      trace("Handling request: " + request.requestObj + " from client: " + request.remoteAddress)
+      request.requestId match {
+        case RequestKeys.ProduceKey => handleProducerOrOffsetCommitRequest(request)
+        case RequestKeys.FetchKey => handleFetchRequest(request)
+        case RequestKeys.OffsetsKey => handleOffsetRequest(request)
+        case RequestKeys.MetadataKey => handleTopicMetadataRequest(request)
+        case RequestKeys.LeaderAndIsrKey => handleLeaderAndIsrRequest(request)
+        case RequestKeys.StopReplicaKey => handleStopReplicaRequest(request)
+        case RequestKeys.UpdateMetadataKey => handleUpdateMetadataRequest(request)
+        case RequestKeys.ControlledShutdownKey => handleControlledShutdownRequest(request)
+        case RequestKeys.OffsetCommitKey => handleOffsetCommitRequest(request)
+        case RequestKeys.OffsetFetchKey => handleOffsetFetchRequest(request)
+        case RequestKeys.ConsumerMetadataKey => handleConsumerMetadataRequest(request)
+        case requestId => throw new KafkaException("Unknown api code " + requestId)
+      }
+    } catch {
+      case e: Throwable =>
+        request.requestObj.handleError(e, requestChannel, request)
+        error("error when handling request %s".format(request.requestObj), e)
+    } finally
+      request.apiLocalCompleteTimeMs = SystemTime.milliseconds
+  }
+}
+```
 
+##### 4.3.5.1 ProducerRequest/CommitOffsetRequest
 
+###### handleProducerOrOffsetCommitRequest
 
+>   * Handle a produce request or offset commit request (which is really a specialized producer request)
+>   * kafka acks ==  0，意味着producer不等待broker同步完成的确认，继续发送下一条(批)信息
+>   * kafka acks ==  1，意味着producer要等待leader成功收到数据并得到确认，才发送下一条message。此选项提供了较好的持久性较低的延迟性。
+>   * kafka acks == -1，意味着producer得到follower确认，才发送下一条数据
+
+```scala
+  def handleProducerOrOffsetCommitRequest(request: RequestChannel.Request): Unit = {
+    // ProducerRequest 和 OffsetCommitRequest 公共这个方法
+    val (produceRequest, offsetCommitRequestOpt) = {
+      // 如果是 OffsetCommitRequest，那么构造对应的实体
+      if (request.requestId == RequestKeys.OffsetCommitKey) {
+        val offsetCommitRequest = request.requestObj.asInstanceOf[OffsetCommitRequest]
+        OffsetCommitRequest.changeInvalidTimeToCurrentTime(offsetCommitRequest)
+        (producerRequestFromOffsetCommit(offsetCommitRequest), Some(offsetCommitRequest))
+      } else {
+        (request.requestObj.asInstanceOf[ProducerRequest], None)
+      }
+    }
+
+    if (produceRequest.requiredAcks > 1 || produceRequest.requiredAcks < -1) {
+      warn(("Client %s from %s sent a produce request with request.required.acks of %d, which is now deprecated and will " +
+            "be removed in next release. Valid values are -1, 0 or 1. Please consult Kafka documentation for supported " +
+            "and recommended configuration.").format(produceRequest.clientId, request.remoteAddress, produceRequest.requiredAcks))
+    }
+
+    val sTime = SystemTime.milliseconds
+    // 将日志写入到本地文件
+    val localProduceResults = appendToLocalLog(produceRequest, offsetCommitRequestOpt.nonEmpty)
+    debug("Produce to local log in %d ms".format(SystemTime.milliseconds - sTime))
+
+    // 获取异常错误
+    val firstErrorCode = localProduceResults.find(ret => ret.errorCode != ErrorMapping.NoError).map(_.errorCode).getOrElse(ErrorMapping.NoError)
+
+    // 统计出现异常的 partition 数量
+    val numPartitionsInError = localProduceResults.count(_.error.isDefined)
+    if(produceRequest.requiredAcks == 0) {
+      // 如果生产者 request.required.acks = 0，则无需操作；
+      // 但是，如果在处理请求时出现任何异常，由于生产者不期望响应，处理程序将向套接字服务器发送关闭连接响应以关闭套接字，
+      // 以便生产者客户端知道发生了一些异常并将刷新其元数据
+      if (numPartitionsInError != 0) {
+        info(("Send the close connection response due to error handling produce request " +
+          "[clientId = %s, correlationId = %s, topicAndPartition = %s] with Ack=0")
+          .format(produceRequest.clientId, produceRequest.correlationId, produceRequest.topicPartitionMessageSizeMap.keySet.mkString(",")))
+        requestChannel.closeConnection(request.processor, request)
+      } else {
+        if (firstErrorCode == ErrorMapping.NoError) {
+          // 如果是 offset 提交，那么更新 offset cache
+          offsetCommitRequestOpt.foreach(ocr => offsetManager.putOffsets(ocr.groupId, ocr.requestInfo))
+        }
+
+        if (offsetCommitRequestOpt.isDefined) {
+          // 如果是 offset 提交，那么即使是 ack 为 0 也需要将消息的持久化结果返回给用户
+          val response = offsetCommitRequestOpt.get.responseFor(firstErrorCode, config.offsetMetadataMaxSize)
+          requestChannel.sendResponse(new RequestChannel.Response(request, new BoundedByteBufferSend(response)))
+        } else {
+          // acks == 0，客户端不关心服务端细节，只关心服务端是否收到请求，因此不需要返回执行结果
+          requestChannel.noOperation(request.processor, request)
+        }
+      }
+    } else if (produceRequest.requiredAcks == 1 ||
+        produceRequest.numPartitions <= 0 ||
+        numPartitionsInError == produceRequest.numPartitions) {
+      // 如果 acks == 1，那么客户端需要等 leader 的响应；
+      // 如果客户端需要等待服务端响应，或者目标分区数无效，或者所有的分区持久化全部失败，需要返回具体执行结果
+      if (firstErrorCode == ErrorMapping.NoError) {
+        // 如果是 offset 提交，那么更新 offset cache
+        offsetCommitRequestOpt.foreach(ocr => offsetManager.putOffsets(ocr.groupId, ocr.requestInfo) )
+      }
+
+      // 返回响应
+      // r.start 是消息的 firstOffset
+      val statuses = localProduceResults.map(r => r.key -> ProducerResponseStatus(r.errorCode, r.start)).toMap
+      val response = offsetCommitRequestOpt.map(_.responseFor(firstErrorCode, config.offsetMetadataMaxSize))
+                                           .getOrElse(ProducerResponse(produceRequest.correlationId, statuses))
+
+      requestChannel.sendResponse(new RequestChannel.Response(request, new BoundedByteBufferSend(response)))
+    } else {
+      // 如果 acks == -1，需要等待(min.insync.replica-1)个副本同步数据后才返回响应
+      // create a list of (topic, partition) pairs to use as keys for this delayed request
+      val producerRequestKeys = produceRequest.data.keys.toSeq
+      // 生成一个延迟响应
+      val statuses = localProduceResults.map(r =>
+        r.key -> DelayedProduceResponseStatus(r.end + 1, ProducerResponseStatus(r.errorCode, r.start))).toMap
+      val delayedRequest =  new DelayedProduce(
+        producerRequestKeys,
+        request,
+        produceRequest.ackTimeoutMs.toLong,
+        produceRequest,
+        statuses,
+        offsetCommitRequestOpt)
+
+      // add the produce request for watch if it's not satisfied, otherwise send the response back
+      val satisfiedByMe = producerRequestPurgatory.checkAndMaybeWatch(delayedRequest)
+      if (satisfiedByMe)
+        producerRequestPurgatory.respond(delayedRequest)
+    }
+
+    // we do not need the data anymore
+    produceRequest.emptyData()
+  }
+```
+
+###### ProducerRequestPurgatory
+
+>`ProducerRequestPurgatory` : The purgatory holding delayed producer requests。
+
+###### DelayedProduce
+
+> `DelayedProduce` ： 
+
+```scala
+/** A delayed produce request, which is satisfied (or more
+  * accurately, unblocked) -- if for every partition it produce to:
+  * Case A: This broker is not the leader: unblock - should return error.
+  * Case B: This broker is the leader:
+  *   B.1 - If there was a localError (when writing to the local log): unblock - should return error
+  *   B.2 - else, at least requiredAcks replicas should be caught up to this request.
+  */
+
+```
+
+##### 4.3.5.2 FetchRequest
+
+>      ​    // 这里之前看的时候疑惑了很久，因为开始觉得 replicaId 是 partition 维度的
+>      ​    // 但是更新的时候却是一个 replicaId 对应多个 <TopicAndPartition, Offset>
+>      ​    // 仔细阅读了一下文档后发现，虽然 replica 是对应 TopicAndPartition 的。
+>      ​    // 但是 replicaId 实际是对应的 brokerId
+>      ​    // 比如我们 describe 某个 topic 可能是这样的
+>      ​    // Topic: xxx      Partition: 49   Leader: 22      Replicas: 22,23 Isr: 22,23
+>      ​    // 这代表 <xxx, 49> 的 leader 的 22，而他的 Replicas 是 22 和 23
+
+```scala
+  /**
+   * Handle a fetch request
+   */
+  def handleFetchRequest(request: RequestChannel.Request) {
+    val fetchRequest = request.requestObj.asInstanceOf[FetchRequest]
+    val dataRead = replicaManager.readMessageSets(fetchRequest)
+
+    // if the fetch request comes from the follower,
+    // update its corresponding log end offset
+    // 之前提到过，follower 在发送 FetchRequest 的时候也会带上自己的 offset
+    if(fetchRequest.isFromFollower) {
+      // 这里之前看的时候疑惑了很久，因为开始觉得 replicaId 是 partition 维度的
+      // 但是更新的时候却是一个 replicaId 对应多个 <TopicAndPartition, Offset>
+      // 仔细阅读了一下文档后发现，虽然 replica 是对应 TopicAndPartition 的。
+      // 但是 replicaId 实际是对应的 brokerId
+      // 比如我们 describe 某个 topic 可能是这样的
+      // Topic: xxx      Partition: 49   Leader: 22      Replicas: 22,23 Isr: 22,23
+      // 这代表 <xxx, 49> 的 leader 的 22，而他的 Replicas 是 22 和 23
+      recordFollowerLogEndOffsets(fetchRequest.replicaId, dataRead.mapValues(_.offset))
+    }
+
+    // check if this fetch request can be satisfied right away
+    val bytesReadable = dataRead.values.map(_.data.messages.sizeInBytes).sum
+    val errorReadingData = dataRead.values.foldLeft(false)((errorIncurred, dataAndOffset) =>
+      errorIncurred || (dataAndOffset.data.error != ErrorMapping.NoError))
+    // send the data immediately if 1) fetch request does not want to wait
+    //                              2) fetch request does not require any data
+    //                              3) has enough data to respond
+    //                              4) some error happens while reading data
+    if(fetchRequest.maxWait <= 0 ||
+       fetchRequest.numPartitions <= 0 ||
+       bytesReadable >= fetchRequest.minBytes ||
+       errorReadingData) {
+      debug("Returning fetch response %s for fetch request with correlation id %d to client %s"
+        .format(dataRead.values.map(_.data.error).mkString(","), fetchRequest.correlationId, fetchRequest.clientId))
+      val response = new FetchResponse(fetchRequest.correlationId, dataRead.mapValues(ret => ret.data))
+      requestChannel.sendResponse(new RequestChannel.Response(request, new FetchResponseSend(response)))
+    } else {
+      debug("Putting fetch request with correlation id %d from client %s into purgatory".format(fetchRequest.correlationId,
+        fetchRequest.clientId))
+      // create a list of (topic, partition) pairs to use as keys for this delayed request
+      val delayedFetchKeys = fetchRequest.requestInfo.keys.toSeq
+      val delayedFetch = new DelayedFetch(delayedFetchKeys, request, fetchRequest.maxWait, fetchRequest,
+        dataRead.mapValues(_.offset))
+
+      // add the fetch request for watch if it's not satisfied, otherwise send the response back
+      val satisfiedByMe = fetchRequestPurgatory.checkAndMaybeWatch(delayedFetch)
+      if (satisfiedByMe)
+        fetchRequestPurgatory.respond(delayedFetch)
+    }
+  }
+```
+
+> `recordFollowerLogEndOffsets` 方法会通过 `<Topic, Partition, replicaId>` 定位到一个唯一的副本，然后修改对应的副本的 log end offset 以及 hw。
+
+```scala
+  // <Topic, Partition, replicaId> 可以定位到一个唯一的 Replication
+  private def recordFollowerLogEndOffsets(replicaId: Int, offsets: Map[TopicAndPartition, LogOffsetMetadata]) {
+    debug("Record follower log end offsets: %s ".format(offsets))
+    offsets.foreach {
+      case (topicAndPartition, offset) =>
+        replicaManager.updateReplicaLEOAndPartitionHW(topicAndPartition.topic,
+          topicAndPartition.partition, replicaId, offset)
+
+        // for producer requests with ack > 1, we need to check
+        // if they can be unblocked after some follower's log end offsets have moved
+        replicaManager.unblockDelayedProduceRequests(topicAndPartition)
+    }
+  }
+```
+
+##### 4.3.5.3 OffsetRequest
+
+> 当消费者或者是客户端想要获取某个 topic 在某个时间段的 offset 详情时会发送此请求，broker 收到此请求之后，会响应指定修改时间前的 LogSegment 的 baseOffset。
 
 
 

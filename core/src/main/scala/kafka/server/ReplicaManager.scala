@@ -238,7 +238,7 @@ class ReplicaManager(val config: KafkaConfig,
    * Read from all the offset details given and return a map of
    * (topic, partition) -> PartitionData
    */
-  def readMessageSets(fetchRequest: FetchRequest) = {
+  def readMessageSets(fetchRequest: FetchRequest): Predef.Map[TopicAndPartition, PartitionDataAndOffset] = {
     val isFetchFromFollower = fetchRequest.isFromFollower
     fetchRequest.requestInfo.map
     {
