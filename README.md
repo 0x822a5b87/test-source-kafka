@@ -36,6 +36,26 @@
 
 > `correlationId` 是 int32 类型，由客户端在向服务端发送请求的时候标识的请求ID，服务端在处理完请求之后会将 `correlationId` 放置在 `Response` 中，这样客户端可以把自己发送的 `Request` 还有服务端的 `Response` 关联起来。
 
+### ReplicaManager 中的 `allPartitions` 代表了什么
+
+> `allPartitions` 是一个 key 为 `<topic, partitionId>`， value 为对应的 `Partition` 的 `Pool`，他保存了本台 broker 上的所有 Partition 信息。
+>
+> ```scala
+> private val allPartitions = new Pool[(String, Int), Partition]
+> ```
+>
+> `allPartitions` 仅仅在 `ReplicaManager#getOrCreatePartition` 方法中被修改。
+>
+> > `KafkaApis#handleLeaderAndIsrRequest` -> `ReplicaManager#becomeLeaderOrFollower` -> `ReplicaManager#getOrCreatePartition`
+>
+> **在 broker 启动的时候**，controller 会通过 `KafkaController#onBrokerStartup` 要求 broker 初始化 `allPartitions`
+>
+> > `KafkaController#onBrokerStartup` -> `KafkaController#sendUpdateMetadataRequest` -> `ControllerChannelManager#addUpdateMetadataRequestForBrokers` 或者 `ControllerChannelManager#sendRequestsToBrokers`
+
+### `KafkaApis#handleOffsetRequest`  中 `fetchOffsets` 为什么返回的是 `<TopicAndPartition> -> Seq[Long]`？
+
+> 一个 <TopicAndPartition> 对应一个 offset 没问题，但是实际上，我们的 Log 由多个 LogSegment 构成，我们在消费的时候，可能是指定了 **auto.offset.reset == ealiest**，那么我们可能需要从最早的 LogSegment 开始消费数据。
+
 ## 编译
 
 ### MavenDeployment
@@ -1790,7 +1810,138 @@ class KafkaApis(val requestChannel: RequestChannel,
 
 > 当消费者或者是客户端想要获取某个 topic 在某个时间段的 offset 详情时会发送此请求，broker 收到此请求之后，会响应指定修改时间前的 LogSegment 的 baseOffset。
 
+```scala
+  /**
+   * Service the offset request API 
+   */
+  def handleOffsetRequest(request: RequestChannel.Request): Unit = {
+    val offsetRequest = request.requestObj.asInstanceOf[OffsetRequest]
+    val responseMap = offsetRequest.requestInfo.map(elem => {
+      val (topicAndPartition, partitionOffsetRequestInfo) = elem
+      try {
+        val localReplica = if(!offsetRequest.isFromDebuggingClient) {
+          // 请求来自于普通的消费者，那么 replica 的 leader 必须在本台 broker 上。
+          // 本函数会在 <allPartition> 中获取 <TopicAndPartition> 对应的 Replica，并且在获取不到时抛出异常。
+          replicaManager.getLeaderReplicaIfLocal(topicAndPartition.topic, topicAndPartition.partition)
+        } else {
+          // 仅仅是为了调试，则不需要关心是否是 leader
+          replicaManager.getReplicaOrException(topicAndPartition.topic, topicAndPartition.partition)
+        }
+        val offsets = {
+          // 获取所有 <TopicAndPartition> 对应的 offset
+          // TODO 这里为什么返回的是一个 Seq[Long]
+          val allOffsets = fetchOffsets(replicaManager.logManager,
+                                        topicAndPartition,
+                                        partitionOffsetRequestInfo.time,
+                                        partitionOffsetRequestInfo.maxNumOffsets)
+          if (!offsetRequest.isFromOrdinaryClient) {
+            // 如果是debug，则可以直接返回
+            allOffsets
+          } else {
+            // 不是 debug 则需要根据 HighWatermark 来进行判断。
+            val hw = localReplica.highWatermark.messageOffset
+            if (allOffsets.exists(ret => (ret > hw))) {
+              // 将 offset 替换成 HighWatermark
+              hw +: allOffsets.dropWhile(_ > hw)
+            } else
+              allOffsets
+          }
+        }
+        (topicAndPartition, PartitionOffsetsResponse(ErrorMapping.NoError, offsets))
+      } catch {
+			// ...
+      }
+    })
+    val response = OffsetResponse(offsetRequest.correlationId, responseMap)
+    requestChannel.sendResponse(new RequestChannel.Response(request, new BoundedByteBufferSend(response)))
+  }
+```
 
+> 我们按照 `auto.reset.offset` 指定的策略来查找 **LogSegment 的 offset**。
+
+```scala
+  // 拉取指定 <TopicAndPartition> 在
+  def fetchOffsets(logManager: LogManager, topicAndPartition: TopicAndPartition, timestamp: Long, maxNumOffsets: Int): Seq[Long] = {
+    logManager.getLog(topicAndPartition) match {
+      case Some(log) => 
+        fetchOffsetsBefore(log, timestamp, maxNumOffsets)
+      case None => 
+        if (timestamp == OffsetRequest.LatestTime || timestamp == OffsetRequest.EarliestTime)
+          Seq(0L)
+        else
+          Nil
+    }
+  }
+
+  /**
+   * 拉取 <Log> 指定修改时间 timestamp 之前的 <LogSegment> 的详细信息，最大不超过 maxNumOffsets
+   *
+   * @param log           Log
+   * @param timestamp     指定修改时间
+   * @param maxNumOffsets 获取的最大 LogSegment 个数
+   * @return
+   */
+  def fetchOffsetsBefore(log: Log, timestamp: Long, maxNumOffsets: Int): Seq[Long] = {
+    val segsArray = log.logSegments.toArray
+    var offsetTimeArray: Array[(Long, Long)] = null
+    // 如果最新的 LogSegment 已经有数据的话，这个 LogSegment 也需要读
+    if(segsArray.last.size > 0)
+      offsetTimeArray = new Array[(Long, Long)](segsArray.length + 1)
+    else
+      offsetTimeArray = new Array[(Long, Long)](segsArray.length)
+
+    // 初始化 LogSegment 的 baseOffset 以及 lastModified timestamp
+    for(i <- segsArray.indices)
+      offsetTimeArray(i) = (segsArray(i).baseOffset, segsArray(i).lastModified)
+    if(segsArray.last.size > 0) {
+      // 对于最后一个 LogSegment，它的 offset 不是 baseOffset 而是 LogEndOffset
+      offsetTimeArray(segsArray.length) = (log.logEndOffset, SystemTime.milliseconds)
+    }
+
+    var startIndex = -1
+    // What to do when there is no initial offset in Kafka or if the current offset does not exist any more on the server (e.g. because that data has been deleted):
+    //  earliest: automatically reset the offset to the earliest offset
+    //  latest: automatically reset the offset to the latest offset
+    //  none: throw exception to the consumer if no previous offset is found for the consumer's group
+    //  anything else: throw exception to the consumer.
+    timestamp match {
+      // latest，只需要获取最后一个 LogSegment 的 offset 即可，因为我们直接从最新的 offset 开始消费
+      case OffsetRequest.LatestTime =>
+        startIndex = offsetTimeArray.length - 1
+      // earliest，则需要从第一个 LogSegment 开始消费
+      case OffsetRequest.EarliestTime =>
+        startIndex = 0
+      case _ =>
+        // 如果都没有指定，我们从后往前找到第一个 lastModified timestamp <= timestamp 的并返回。
+        var isFound = false
+        debug("Offset time array = " + offsetTimeArray.foreach(o => "%d, %d".format(o._1, o._2)))
+        startIndex = offsetTimeArray.length - 1
+        while (startIndex >= 0 && !isFound) {
+          if (offsetTimeArray(startIndex)._2 <= timestamp)
+            isFound = true
+          else
+            startIndex -=1
+        }
+    }
+
+    // maxNumOffsets 指定了最大返回的 LogSegment offset 个数
+    val retSize = maxNumOffsets.min(startIndex + 1)
+    // 返回找到的 offset
+    val ret = new Array[Long](retSize)
+    for(j <- 0 until retSize) {
+      ret(j) = offsetTimeArray(startIndex)._1
+      startIndex -= 1
+    }
+    // ensure that the returned seq is in descending order of offsets
+    ret.toSeq.sortBy(- _)
+  }
+```
+
+##### 4.3.5.4 TopicMetadataRequest
+
+> 生产者或者消费者获取 topic metadata 时会发送此请求，会返回所有当前在线的 broker 以及 topic 信息。
+>
+> **topic信息包括了分区索引，Leader Replica，AR 以及 ISR。**
 
 
 

@@ -111,7 +111,7 @@ class KafkaApis(val requestChannel: RequestChannel,
       throw new UnknownTopicOrPartitionException("Topic " + topic + " either doesn't exist or is in the process of being deleted")
   }
 
-  def handleLeaderAndIsrRequest(request: RequestChannel.Request) {
+  def handleLeaderAndIsrRequest(request: RequestChannel.Request): Unit = {
     // ensureTopicExists is only for client facing requests
     // We can't have the ensureTopicExists check here since the controller sends it as an advisory to all brokers so they
     // stop serving data to clients for the topic being deleted
@@ -432,23 +432,30 @@ class KafkaApis(val requestChannel: RequestChannel,
     val responseMap = offsetRequest.requestInfo.map(elem => {
       val (topicAndPartition, partitionOffsetRequestInfo) = elem
       try {
-        // ensure leader exists
-        val localReplica = if(!offsetRequest.isFromDebuggingClient)
+        val localReplica = if(!offsetRequest.isFromDebuggingClient) {
+          // 请求来自于普通的消费者，那么 replica 的 leader 必须在本台 broker 上。
+          // 本函数会在 <allPartition> 中获取 <TopicAndPartition> 对应的 Replica，并且在获取不到时抛出异常。
           replicaManager.getLeaderReplicaIfLocal(topicAndPartition.topic, topicAndPartition.partition)
-        else
+        } else {
+          // 仅仅是为了调试，则不需要关心是否是 leader
           replicaManager.getReplicaOrException(topicAndPartition.topic, topicAndPartition.partition)
+        }
         val offsets = {
+          // 获取所有 <TopicAndPartition> 对应的 offset
           val allOffsets = fetchOffsets(replicaManager.logManager,
                                         topicAndPartition,
                                         partitionOffsetRequestInfo.time,
                                         partitionOffsetRequestInfo.maxNumOffsets)
           if (!offsetRequest.isFromOrdinaryClient) {
+            // 如果是debug，则可以直接返回
             allOffsets
           } else {
+            // 不是 debug 则需要根据 HighWatermark 来进行判断。
             val hw = localReplica.highWatermark.messageOffset
-            if (allOffsets.exists(_ > hw))
+            if (allOffsets.exists(ret => (ret > hw))) {
+              // 将 offset 替换成 HighWatermark
               hw +: allOffsets.dropWhile(_ > hw)
-            else 
+            } else
               allOffsets
           }
         }
@@ -472,7 +479,8 @@ class KafkaApis(val requestChannel: RequestChannel,
     val response = OffsetResponse(offsetRequest.correlationId, responseMap)
     requestChannel.sendResponse(new RequestChannel.Response(request, new BoundedByteBufferSend(response)))
   }
-  
+
+  // 拉取指定 <TopicAndPartition> 在
   def fetchOffsets(logManager: LogManager, topicAndPartition: TopicAndPartition, timestamp: Long, maxNumOffsets: Int): Seq[Long] = {
     logManager.getLog(topicAndPartition) match {
       case Some(log) => 
@@ -484,27 +492,47 @@ class KafkaApis(val requestChannel: RequestChannel,
           Nil
     }
   }
-  
+
+  /**
+   * 拉取 <Log> 指定修改时间 timestamp 之前的 <LogSegment> 的详细信息，最大不超过 maxNumOffsets
+   *
+   * @param log           Log
+   * @param timestamp     指定修改时间
+   * @param maxNumOffsets 获取的最大 LogSegment 个数
+   * @return
+   */
   def fetchOffsetsBefore(log: Log, timestamp: Long, maxNumOffsets: Int): Seq[Long] = {
     val segsArray = log.logSegments.toArray
     var offsetTimeArray: Array[(Long, Long)] = null
+    // 如果最新的 LogSegment 已经有数据的话，这个 LogSegment 也需要读
     if(segsArray.last.size > 0)
       offsetTimeArray = new Array[(Long, Long)](segsArray.length + 1)
     else
       offsetTimeArray = new Array[(Long, Long)](segsArray.length)
 
-    for(i <- 0 until segsArray.length)
+    // 初始化 LogSegment 的 baseOffset 以及 lastModified timestamp
+    for(i <- segsArray.indices)
       offsetTimeArray(i) = (segsArray(i).baseOffset, segsArray(i).lastModified)
-    if(segsArray.last.size > 0)
+    if(segsArray.last.size > 0) {
+      // 对于最后一个 LogSegment，它的 offset 不是 baseOffset 而是 LogEndOffset
       offsetTimeArray(segsArray.length) = (log.logEndOffset, SystemTime.milliseconds)
+    }
 
     var startIndex = -1
+    // What to do when there is no initial offset in Kafka or if the current offset does not exist any more on the server (e.g. because that data has been deleted):
+    //  earliest: automatically reset the offset to the earliest offset
+    //  latest: automatically reset the offset to the latest offset
+    //  none: throw exception to the consumer if no previous offset is found for the consumer's group
+    //  anything else: throw exception to the consumer.
     timestamp match {
+      // latest，只需要获取最后一个 LogSegment 的 offset 即可，因为我们直接从最新的 offset 开始消费
       case OffsetRequest.LatestTime =>
         startIndex = offsetTimeArray.length - 1
+      // earliest，则需要从第一个 LogSegment 开始消费
       case OffsetRequest.EarliestTime =>
         startIndex = 0
       case _ =>
+        // 如果都没有指定，我们从后往前找到第一个 lastModified timestamp <= timestamp 的并返回。
         var isFound = false
         debug("Offset time array = " + offsetTimeArray.foreach(o => "%d, %d".format(o._1, o._2)))
         startIndex = offsetTimeArray.length - 1
@@ -516,7 +544,9 @@ class KafkaApis(val requestChannel: RequestChannel,
         }
     }
 
+    // maxNumOffsets 指定了最大返回的 LogSegment offset 个数
     val retSize = maxNumOffsets.min(startIndex + 1)
+    // 返回找到的 offset
     val ret = new Array[Long](retSize)
     for(j <- 0 until retSize) {
       ret(j) = offsetTimeArray(startIndex)._1
