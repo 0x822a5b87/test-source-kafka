@@ -40,7 +40,12 @@ class KafkaHealthcheck(private val brokerId: Int,
   val brokerIdPath = ZkUtils.BrokerIdsPath + "/" + brokerId
   val sessionExpireListener = new SessionExpireListener
 
-  def startup() {
+  /**
+   * 函数在 KafkaServer#startup 时调用
+   */
+  def startup(): Unit = {
+    // 函数首先注册了一个监听函数监听 session expire 事件，当我们收到一个 session expire 事件时
+    // 我们丢失了所有的 ephemeral nodes 以及 zkClient，我们需要重新注册 broker 到 zk
     zkClient.subscribeStateChanges(sessionExpireListener)
     register()
   }
@@ -48,7 +53,7 @@ class KafkaHealthcheck(private val brokerId: Int,
   /**
    * Register this broker as "alive" in zookeeper
    */
-  def register() {
+  def register(): Unit = {
     val advertisedHostName = 
       if(advertisedHost == null || advertisedHost.trim.isEmpty) 
         InetAddress.getLocalHost.getCanonicalHostName 
@@ -64,7 +69,7 @@ class KafkaHealthcheck(private val brokerId: Int,
    */
   class SessionExpireListener() extends IZkStateListener {
     @throws(classOf[Exception])
-    def handleStateChanged(state: KeeperState) {
+    def handleStateChanged(state: KeeperState): Unit = {
       // do nothing, since zkclient will do reconnect for us.
     }
 
@@ -76,7 +81,7 @@ class KafkaHealthcheck(private val brokerId: Int,
      *             On any error.
      */
     @throws(classOf[Exception])
-    def handleNewSession() {
+    def handleNewSession(): Unit = {
       info("re-registering broker info in ZK for broker " + brokerId)
       register()
       info("done re-registering broker")

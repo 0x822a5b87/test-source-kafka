@@ -2541,6 +2541,84 @@ class KafkaApis(val requestChannel: RequestChannel,
   }
 ```
 
+### 4.4 KafkaHealthcheck
+
+> KafkaHealthcheck 主要提供 broker server 的健康状态上报；
+>
+> KafkaHealthcheck 在 zookeeper 的路径 `/brokers/ids` 上注册了一个 EphemeralPath，这个节点在broker由于异常情况下线时会被删除。
+>
+> 而 `BrokerChangeListener` 通过监听该目录来判断是否有broker上线和下线。
+
+```scala
+/**
+ * This class registers the broker in zookeeper to allow 
+ * other brokers and consumers to detect failures. It uses an ephemeral znode with the path:
+ *   /brokers/[0...N] --> advertisedHost:advertisedPort
+ *   
+ * Right now our definition of health is fairly naive. If we register in zk we are healthy, otherwise
+ * we are dead.
+ */
+class KafkaHealthcheck(private val brokerId: Int, 
+                       private val advertisedHost: String, 
+                       private val advertisedPort: Int,
+                       private val zkSessionTimeoutMs: Int,
+                       private val zkClient: ZkClient) extends Logging {
+
+  val brokerIdPath = ZkUtils.BrokerIdsPath + "/" + brokerId
+  val sessionExpireListener = new SessionExpireListener
+
+  /**
+   * 函数在 KafkaServer#startup 时调用
+   */
+  def startup(): Unit = {
+    // 函数首先注册了一个监听函数监听 session expire 事件，当我们收到一个 session expire 事件时
+    // 我们丢失了所有的 ephemeral nodes 以及 zkClient，我们需要重新注册 broker 到 zk
+    zkClient.subscribeStateChanges(sessionExpireListener)
+    register()
+  }
+
+  /**
+   * Register this broker as "alive" in zookeeper
+   */
+  def register(): Unit = {
+    val advertisedHostName = 
+      if(advertisedHost == null || advertisedHost.trim.isEmpty) 
+        InetAddress.getLocalHost.getCanonicalHostName 
+      else
+        advertisedHost
+    val jmxPort = System.getProperty("com.sun.management.jmxremote.port", "-1").toInt
+    ZkUtils.registerBrokerInZk(zkClient, brokerId, advertisedHostName, advertisedPort, zkSessionTimeoutMs, jmxPort)
+  }
+
+  /**
+   *  When we get a SessionExpired event, we lost all ephemeral nodes and zkclient has reestablished a
+   *  connection for us. We need to re-register this broker in the broker registry.
+   */
+  class SessionExpireListener() extends IZkStateListener {
+    @throws(classOf[Exception])
+    def handleStateChanged(state: KeeperState): Unit = {
+      // do nothing, since zkclient will do reconnect for us.
+    }
+
+    /**
+     * Called after the zookeeper session has expired and a new session has been created. You would have to re-create
+     * any ephemeral nodes here.
+     *
+     * @throws Exception
+     *             On any error.
+     */
+    @throws(classOf[Exception])
+    def handleNewSession(): Unit = {
+      info("re-registering broker info in ZK for broker " + brokerId)
+      register()
+      info("done re-registering broker")
+      info("Subscribing to %s path to watch for new topics".format(ZkUtils.BrokerTopicsPath))
+    }
+  }
+
+}
+```
+
 
 
 
