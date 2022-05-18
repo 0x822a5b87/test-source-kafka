@@ -170,6 +170,7 @@ class ReplicaManager(val config: KafkaConfig,
   def stopReplicas(stopReplicaRequest: StopReplicaRequest): (mutable.Map[TopicAndPartition, Short], Short) = {
     replicaStateChangeLock synchronized {
       val responseMap = new collection.mutable.HashMap[TopicAndPartition, Short]
+      // 如果请求的 epoch 小于当前 epoch，说明请求已经过时了
       if(stopReplicaRequest.controllerEpoch < controllerEpoch) {
         (responseMap, ErrorMapping.StaleControllerEpochCode)
       } else {
@@ -197,10 +198,7 @@ class ReplicaManager(val config: KafkaConfig,
 
   def getPartition(topic: String, partitionId: Int): Option[Partition] = {
     val partition = allPartitions.get((topic, partitionId))
-    if (partition == null)
-      None
-    else
-      Some(partition)
+    Option(partition)
   }
 
   def getReplicaOrException(topic: String, partition: Int): Replica = {

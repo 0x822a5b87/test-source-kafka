@@ -103,10 +103,14 @@ abstract class AbstractFetcherManager(protected val name: String, clientId: Stri
     info("Removed fetcher for partitions %s".format(partitions.mkString(",")))
   }
 
-  def shutdownIdleFetcherThreads() {
+  def shutdownIdleFetcherThreads(): Unit = {
     mapLock synchronized {
       val keysToBeRemoved = new mutable.HashSet[BrokerAndFetcherId]
       for ((key, fetcher) <- fetcherThreadMap) {
+        // 每一个 fetcher 负责另外一台 broker 上所有的 leader partition
+        // 比如有 A 和 B 两台 broker，其中 A 的 partition0 和 partition1 的 leader 都在 B 上
+        // 那么那么这两个分区都由一个 fetcher 来负责
+        // 当 A 上所有的 follower，都不存在对应的 leader 在 A 时，这个 fetcher 就可以回收了
         if (fetcher.partitionCount <= 0) {
           fetcher.shutdown()
           keysToBeRemoved += key

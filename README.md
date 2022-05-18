@@ -13,6 +13,8 @@
 ### read(startOffset: Long, maxLength: Int, maxOffset: Option[Long] = None): 
 
 > 为什么 LogManager 在读数据的时候，需要有一个 `maxOffset` 指定可以拉取的最大偏移数？
+>
+> - `maxOffset` 是因为在有些情况下Segment的可读数据与日志的实际存储数据不一致；例如，当数据已经写入 leader，但是 follower 尚未 fetch 到这些数据，此时 HighWatermark 就会使得 Segment 中有一部分数据不可读。
 
 ### 为什么每次提交 FetchRequest 时都需要带上自己的 offset
 
@@ -89,6 +91,67 @@
 > 调用链为
 >
 > > `controler 发送 UpdateMetadataRequest` -> `kafkaApis#handleUpdateMetadataRequest` -> `maybeUpdateMetadataCache#maybeUpdateMetadataCache` -> `MetadataCache#updateCache`
+
+### Partition and Replica
+
+> 注意到，在 `ReplicaManager#stopReplicas` 中，有一行：
+>
+> ```scala
+> // First stop fetchers for all partitions, then stop the corresponding replicas
+> replicaFetcherManager.removeFetcherForPartitions(stopReplicaRequest.partitions.map(r => TopicAndPartition(r.topic, r.partition)))
+> ```
+>
+> 那么在实际的代码中 `Partition` 和 `Replica` 到底是一个怎么样的概念呢？
+
+> ```scala
+> /**
+>  * Data structure that represents a topic partition. The leader maintains the AR, ISR, CUR, RAR
+>  */
+> class Partition(val topic: String,
+>                 val partitionId: Int,
+>                 time: Time,
+>                 replicaManager: ReplicaManager) extends Logging with KafkaMetricsGroup {
+>   private val localBrokerId = replicaManager.config.brokerId
+>   // AR
+>   private val assignedReplicaMap = new Pool[Int, Replica]
+>   @volatile var leaderReplicaIdOpt: Option[Int] = None
+>   // ISR
+>   @volatile var inSyncReplicas: Set[Replica] = Set.empty[Replica]
+> }
+> ```
+>
+> 以上是 Partition 的定义，每个 Partition 都保存了 `topic`, `partitionId`, `localBrokerId`,同时 leader 保存了 `AR`, `ISR`：**从这里可以看得出来， Partition 和  Replica 是一个一对多的关系。** 
+>
+> 
+>
+> 另外还可以参考 [FetchRequest](#FetchRequest) 这里的解释。
+
+### AbstractFetcherManager#shutdownIdleFetcherThreads
+
+> 在 `AbstractFetcherManager#shutdownIdleFetcherThreads` 中，我们回收了空闲 fetcher，那么 fetcher 到底是什么呢？
+>
+> ```scala
+>   def shutdownIdleFetcherThreads(): Unit = {
+>     mapLock synchronized {
+>       val keysToBeRemoved = new mutable.HashSet[BrokerAndFetcherId]
+>       for ((key, fetcher) <- fetcherThreadMap) {
+>         if (fetcher.partitionCount <= 0) {
+>           fetcher.shutdown()
+>           keysToBeRemoved += key
+>         }
+>       }
+>       fetcherThreadMap --= keysToBeRemoved
+>     }
+>   }
+> ```
+
+> `fetcher` `AbstractFetcherThread` 包含了 `ConsumerFetcherThread` 和 `ReplicaFetcherThread` 两个不同的实现，我们以 `ReplicaFetcherThread` 为例子：
+>
+> Partition 通过 `ReplicaFetcherThread` 来拉取 leader 上的数据。
+>
+> - fetcher 的实际线程数根据 `num.replica.fetchers(默认为1)` 以及 `要连接的broker` 共同决定；
+> - 一台 broker 上会包含很多 <TopicAndPartition> 的 follower，并且这些 <TopicAndPartition> 的 leader 分布在不同的 broker 上；每个 fetcher 线程只会连接其中一台 broker 并同步分布在这台 broker 上的 <TopicAndPartition>；也就是说，实际的 fetcher 线程的数量最大等于 `num.replica.fetchers` * `num.of.brokers - 1`（但是实际不一定，因为有可能某台broker的所有 leader 都不在另外一台 broker 上，此时不会有 fetcher 线程去连接这两台 broker。）
+> - **不同的broker只会起一个线程进行同步**，而这个线程会同步这个broker上的所有不同topic和partition的数据。
 
 ## 编译
 
@@ -1758,6 +1821,8 @@ class KafkaApis(val requestChannel: RequestChannel,
 
 ```
 
+<a name="FetchRequest"></a>
+
 ##### 4.3.5.2 FetchRequest
 
 >      ​    // 这里之前看的时候疑惑了很久，因为开始觉得 replicaId 是 partition 维度的
@@ -2116,6 +2181,92 @@ class KafkaApis(val requestChannel: RequestChannel,
 > 1. 当 broker 发生宕机时，在本台 broker 上的leader replica会发生 leader 切换，follower replica 也需要从 ISR 中删除；
 > 2. ISR 由于长时间未上报心跳，或者说与leader的延迟较大也会触发此请求；
 > 3. 手动指定replica分布；
+
+```scala
+  def handleLeaderAndIsrRequest(request: RequestChannel.Request): Unit = {
+    // ensureTopicExists is only for client facing requests
+    // We can't have the ensureTopicExists check here since the controller sends it as an advisory to all brokers so they
+    // stop serving data to clients for the topic being deleted
+    val leaderAndIsrRequest = request.requestObj.asInstanceOf[LeaderAndIsrRequest]
+    try {
+      val (response, error) = replicaManager.becomeLeaderOrFollower(leaderAndIsrRequest, offsetManager)
+      val leaderAndIsrResponse = new LeaderAndIsrResponse(leaderAndIsrRequest.correlationId, response, error)
+      requestChannel.sendResponse(new Response(request, new BoundedByteBufferSend(leaderAndIsrResponse)))
+    } catch {
+      case e: KafkaStorageException =>
+        fatal("Disk error during leadership change.", e)
+        Runtime.getRuntime.halt(1)
+    }
+  }
+```
+
+##### 4.3.5.6 StopReplicaRequest
+
+> 当某个 partition 被删除或者强制下线的时候，controller 会发送这个 request 到所有的 broker，broker 收到 request 后执行相应的操作，这个过程分为以下几步：
+>
+> 1. 停止 `stopReplicaRequest` 中所有指定的 `<TopicAndPartition>` 的 fetcher；
+> 2. 再判断是否需要删除分区相关信息；
+> 3. 如果 fetcher 已经没有需要拉取的 partition 了，那么回收 fetcher。
+
+```scala
+  def handleStopReplicaRequest(request: RequestChannel.Request): Unit = {
+    // ensureTopicExists is only for client facing requests
+    // We can't have the ensureTopicExists check here since the controller sends it as an advisory to all brokers so they
+    // stop serving data to clients for the topic being deleted
+    val stopReplicaRequest = request.requestObj.asInstanceOf[StopReplicaRequest]
+    // 停止所有 replica
+    val (response, error) = replicaManager.stopReplicas(stopReplicaRequest)
+    val stopReplicaResponse = new StopReplicaResponse(stopReplicaRequest.correlationId, response.toMap, error)
+    requestChannel.sendResponse(new Response(request, new BoundedByteBufferSend(stopReplicaResponse)))
+    // 关闭所有 Fetcher 线程
+    replicaManager.replicaFetcherManager.shutdownIdleFetcherThreads()
+  }
+```
+
+###### stopReplicas
+
+```scala
+  def stopReplicas(stopReplicaRequest: StopReplicaRequest): (mutable.Map[TopicAndPartition, Short], Short) = {
+    replicaStateChangeLock synchronized {
+      val responseMap = new collection.mutable.HashMap[TopicAndPartition, Short]
+      // 如果请求的 epoch 小于当前 epoch，说明请求已经过时了
+      if(stopReplicaRequest.controllerEpoch < controllerEpoch) {
+        (responseMap, ErrorMapping.StaleControllerEpochCode)
+      } else {
+        controllerEpoch = stopReplicaRequest.controllerEpoch
+        // First stop fetchers for all partitions, then stop the corresponding replicas
+        replicaFetcherManager.removeFetcherForPartitions(stopReplicaRequest.partitions.map(r => TopicAndPartition(r.topic, r.partition)))
+        // 再根据 deletePartitions 判断是否需要删除分区
+        for(topicAndPartition <- stopReplicaRequest.partitions){
+          val errorCode = stopReplica(topicAndPartition.topic, topicAndPartition.partition, stopReplicaRequest.deletePartitions)
+          responseMap.put(topicAndPartition, errorCode)
+        }
+        (responseMap, ErrorMapping.NoError)
+      }
+    }
+  }
+```
+
+###### shutdownIdleFetcherThreads
+
+```scala
+  def shutdownIdleFetcherThreads(): Unit = {
+    mapLock synchronized {
+      val keysToBeRemoved = new mutable.HashSet[BrokerAndFetcherId]
+      for ((key, fetcher) <- fetcherThreadMap) {
+        // 每一个 fetcher 负责另外一台 broker 上所有的 leader partition
+        // 比如有 A 和 B 两台 broker，其中 A 的 partition0 和 partition1 的 leader 都在 B 上
+        // 那么那么这两个分区都由一个 fetcher 来负责
+        // 当 A 上所有的 follower，都不存在对应的 leader 在 A 时，这个 fetcher 就可以回收了
+        if (fetcher.partitionCount <= 0) {
+          fetcher.shutdown()
+          keysToBeRemoved += key
+        }
+      }
+      fetcherThreadMap --= keysToBeRemoved
+    }
+  }
+```
 
 
 
