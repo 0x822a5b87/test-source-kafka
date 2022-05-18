@@ -153,6 +153,28 @@
 > - 一台 broker 上会包含很多 <TopicAndPartition> 的 follower，并且这些 <TopicAndPartition> 的 leader 分布在不同的 broker 上；每个 fetcher 线程只会连接其中一台 broker 并同步分布在这台 broker 上的 <TopicAndPartition>；也就是说，实际的 fetcher 线程的数量最大等于 `num.replica.fetchers` * `num.of.brokers - 1`（但是实际不一定，因为有可能某台broker的所有 leader 都不在另外一台 broker 上，此时不会有 fetcher 线程去连接这两台 broker。）
 > - **不同的broker只会起一个线程进行同步**，而这个线程会同步这个broker上的所有不同topic和partition的数据。
 
+### ControlledShutdownRequest 
+
+#### 问题1
+
+> `controllerContext.shuttingDownBrokerIds.add(id)` 在将 broker 添加到下线名单之后会有什么影响？
+
+#### 问题2
+
+> 为什么在 `replicationFactor > 1` 只处理了副本数大于1的 partition？
+
+#### 问题3
+
+> 对于 `currLeaderIsrAndControllerEpoch.leaderAndIsr.leader == id` 这种是leader的分区，为什么是设置 partition 状态为 OnlinePartition？
+
+### OffsetRequest 和 OffsetFetchRequest 的差别
+
+### OffsetManager#getOffsets 中只有 leader 提供服务
+
+>`KafkaApis#handleOffsetFetchRequest` -> `OffsetManager#getOffsets`，本方法只有在 `KafkaApis#handleOffsetFetchRequest` 中会调用，而这个调用则来自于 `RequestChannel` 中取出的 `Request`。
+>
+>controller 只会向 leader 发送这个消息。
+
 ## 编译
 
 ### MavenDeployment
@@ -2268,11 +2290,256 @@ class KafkaApis(val requestChannel: RequestChannel,
   }
 ```
 
+##### 4.3.5.7 UpdateMetadataRequest
 
+> 当 `topic` 的元数据发生改变时，controller 会将此请求发送到相关的 broker，broker 会将数据缓存到内存。
 
+```scala
+  def maybeUpdateMetadataCache(updateMetadataRequest: UpdateMetadataRequest, metadataCache: MetadataCache): Unit = {
+    replicaStateChangeLock synchronized {
+      // 如果该请求的 epoch 小于已经当前的 epoch，那么本次请求无效。
+      if(updateMetadataRequest.controllerEpoch < controllerEpoch) {
+        val stateControllerEpochErrorMessage = ("Broker %d received update metadata request with correlation id %d from an " +
+          "old controller %d with epoch %d. Latest known controller epoch is %d").format(localBrokerId,
+          updateMetadataRequest.correlationId, updateMetadataRequest.controllerId, updateMetadataRequest.controllerEpoch,
+          controllerEpoch)
+        stateChangeLogger.warn(stateControllerEpochErrorMessage)
+        throw new ControllerMovedException(stateControllerEpochErrorMessage)
+      } else {
+        // 更新 <MetadataCache>，<MetadataCache> 保存了
+        // 1. aliveBrokers 在线的 broker
+        // 2. mutable.Map[String, mutable.Map[Int, PartitionStateInfo]] 保存了 topic -> [partitionId -> PartitionStateInfo] 的详细信息
+        metadataCache.updateCache(updateMetadataRequest, localBrokerId, stateChangeLogger)
+        //  更新 epoch
+        controllerEpoch = updateMetadataRequest.controllerEpoch
+      }
+    }
+  }
+```
 
+##### 4.3.5.8 ControlledShutdownRequest
 
+> 当 broker 准备下线时向 controller 发送此请求。
+>
+> 在这个 Request 中，我们开始接触到一个重要的东西：`PartitionStateMachine`，该状态机维护了分区状态。
 
+```scala
+  /**
+   * On clean shutdown, the controller first determines the partitions that the
+   * shutting down broker leads, and moves leadership of those partitions to another broker
+   * that is in that partition's ISR.
+   *
+   * @param id Id of the broker to shutdown.
+   * @return The number of partitions that the broker still leads.
+   */
+  def shutdownBroker(id: Int) : Set[TopicAndPartition] = {
+
+    // controller 必须存活且是leader
+    if (!isActive()) {
+      throw new ControllerMovedException("Controller moved to another broker. Aborting controlled shutdown")
+    }
+
+    controllerContext.brokerShutdownLock synchronized {
+      info("Shutting down broker " + id)
+
+      inLock(controllerContext.controllerLock) {
+        // 如果 broker 不可用直接抛出异常
+        if (!controllerContext.liveOrShuttingDownBrokerIds.contains(id))
+          throw new BrokerNotAvailableException("Broker id %d does not exist.".format(id))
+
+        // 将broker添加到下线broker名单中
+        controllerContext.shuttingDownBrokerIds.add(id)
+        debug("All shutting down brokers: " + controllerContext.shuttingDownBrokerIds.mkString(","))
+        debug("Live brokers: " + controllerContext.liveBrokerIds.mkString(","))
+      }
+
+      // 查询某台broker上的 [<TopicAndPartition> -> Replica数(replicationFactor)] 的映射关系
+      // 我们需要知道某一个 <TopicAndPartition> 的副本数，因为这台 broker 上的 leader 和 follower 都需要处理
+      val allPartitionsAndReplicationFactorOnBroker: Set[(TopicAndPartition, Int)] =
+        inLock(controllerContext.controllerLock) {
+          controllerContext.partitionsOnBroker(id)
+            .map(topicAndPartition => (topicAndPartition, controllerContext.partitionReplicaAssignment(topicAndPartition).size))
+        }
+
+      allPartitionsAndReplicationFactorOnBroker.foreach {
+        case(topicAndPartition, replicationFactor) =>
+          // Move leadership serially to relinquish lock.
+          inLock(controllerContext.controllerLock) {
+            controllerContext.partitionLeadershipInfo.get(topicAndPartition).foreach { currLeaderIsrAndControllerEpoch =>
+              // 对于某一个在本台 broker 的 <TopicAndPartition>，如果他的副本数大于1
+              if (replicationFactor > 1) {
+                if (currLeaderIsrAndControllerEpoch.leaderAndIsr.leader == id) {
+                  // 如果该broker是leader，转移leader并且更新ISR。更新zookeeper并且通知所有受影响的broker
+                  // 将 topicAndPartition 对应的状态设置为 Online
+                  partitionStateMachine.handleStateChanges(Set(topicAndPartition), OnlinePartition,
+                    controlledShutdownPartitionLeaderSelector)
+                } else {
+                  // 先停止副本。 下面的状态更改会启动 ZK 更改，这需要一段时间才能完成停止副本请求（在大多数情况下）
+                  // Stop the replica first. The state change below initiates ZK changes which should take some time
+                  // before which the stop replica request should be completed (in most cases)
+                  brokerRequestBatch.newBatch()
+                  brokerRequestBatch.addStopReplicaRequestForBrokers(Seq(id), topicAndPartition.topic,
+                    topicAndPartition.partition, deletePartition = false)
+                  brokerRequestBatch.sendRequestsToBrokers(epoch, controllerContext.correlationId.getAndIncrement)
+
+                  // If the broker is a follower, updates the isr in ZK and notifies the current leader
+                  replicaStateMachine.handleStateChanges(Set(PartitionAndReplica(topicAndPartition.topic,
+                    topicAndPartition.partition, id)), OfflineReplica)
+                }
+              }
+            }
+          }
+      }
+
+      // 返回所有在本台broker上的partition的leader并且副本数大于1的partition
+      def replicatedPartitionsBrokerLeads() = inLock(controllerContext.controllerLock) {
+        trace("All leaders = " + controllerContext.partitionLeadershipInfo.mkString(","))
+        controllerContext.partitionLeadershipInfo.filter {
+          case (topicAndPartition, leaderIsrAndControllerEpoch) =>
+            leaderIsrAndControllerEpoch.leaderAndIsr.leader == id && controllerContext.partitionReplicaAssignment(topicAndPartition).size > 1
+        }.keys
+      }
+      replicatedPartitionsBrokerLeads().toSet
+    }
+  }
+```
+
+##### 4.3.5.9 OffsetCommitRequest
+
+> 当消费需要提交 **consumer group 的消费情况** 时会发送此请求。
+>
+> 1. versionId == 0 提交 offset 到 zk；
+> 2. versionId == 1 提交 offset 到kafka的一个特殊的 topic；
+
+```scala
+  def handleOffsetCommitRequest(request: RequestChannel.Request): Unit = {
+    val offsetCommitRequest = request.requestObj.asInstanceOf[OffsetCommitRequest]
+    if (offsetCommitRequest.versionId == 0) {
+      // version 0 stores the offsets in ZK
+      val responseInfo = offsetCommitRequest.requestInfo.map{
+        case (topicAndPartition, metaAndError) => {
+          // 构建提交的offset在zk中的文件目录
+          val topicDirs = new ZKGroupTopicDirs(offsetCommitRequest.groupId, topicAndPartition.topic)
+          try {
+            ensureTopicExists(topicAndPartition.topic)
+            if(metaAndError.metadata != null && metaAndError.metadata.length > config.offsetMetadataMaxSize) {
+              (topicAndPartition, ErrorMapping.OffsetMetadataTooLargeCode)
+            } else {
+              // 持久化consumer offset到zk
+              ZkUtils.updatePersistentPath(zkClient, topicDirs.consumerOffsetDir + "/" +
+                topicAndPartition.partition, metaAndError.offset.toString)
+              (topicAndPartition, ErrorMapping.NoError)
+            }
+          } catch {
+            case e: Throwable => (topicAndPartition, ErrorMapping.codeFor(e.getClass.asInstanceOf[Class[Throwable]]))
+          }
+        }
+      }
+      val response = new OffsetCommitResponse(responseInfo, offsetCommitRequest.correlationId)
+      requestChannel.sendResponse(new RequestChannel.Response(request, new BoundedByteBufferSend(response)))
+    } else {
+      // version 1 and above store the offsets in a special Kafka topic
+      handleProducerOrOffsetCommitRequest(request)
+    }
+  }
+```
+
+##### 4.3.5.10 OffsetFetchRequest
+
+> 当消费者查询 **consumer group** 的消费情况时会发送此请求。
+>
+> 1. 考虑到频繁的zookeeper并不适合频繁的读写，所以建议用户使用kafka自身存储offset。
+
+```scala
+  /*
+   * Service the Offset fetch API
+   */
+  def handleOffsetFetchRequest(request: RequestChannel.Request): Unit = {
+    val offsetFetchRequest = request.requestObj.asInstanceOf[OffsetFetchRequest]
+
+    if (offsetFetchRequest.versionId == 0) {
+      // version 0 reads offsets from ZK
+      val responseInfo = offsetFetchRequest.requestInfo.map( t => {
+        val topicDirs = new ZKGroupTopicDirs(offsetFetchRequest.groupId, t.topic)
+        try {
+          ensureTopicExists(t.topic)
+          // 拼接zk path并且读取数据
+          val payloadOpt = ZkUtils.readDataMaybeNull(zkClient, topicDirs.consumerOffsetDir + "/" + t.partition)._1
+          payloadOpt match {
+            // 如果读取导数据，则返回 <TopicAndPartition> -> offset 的映射关系
+            case Some(payload) => {
+              (t, OffsetMetadataAndError(offset=payload.toLong, error=ErrorMapping.NoError))
+            }
+            case None => (t, OffsetMetadataAndError(OffsetAndMetadata.InvalidOffset, OffsetAndMetadata.NoMetadata,
+              ErrorMapping.UnknownTopicOrPartitionCode))
+          }
+        } catch {
+          case e: Throwable =>
+            (t, OffsetMetadataAndError(OffsetAndMetadata.InvalidOffset, OffsetAndMetadata.NoMetadata,
+              ErrorMapping.codeFor(e.getClass.asInstanceOf[Class[Throwable]])))
+        }
+      })
+      // 返回结果
+      val response = new OffsetFetchResponse(collection.immutable.Map(responseInfo: _*), offsetFetchRequest.correlationId)
+      requestChannel.sendResponse(new RequestChannel.Response(request, new BoundedByteBufferSend(response)))
+    } else {
+      // version 1 reads offsets from Kafka
+      // 通过读取 metadataCache，我们可以知道哪些<TopicAndPartition> 当前是已有的。
+      val (unknownTopicPartitions, knownTopicPartitions) = offsetFetchRequest.requestInfo.partition(topicAndPartition =>
+        metadataCache.getPartitionInfo(topicAndPartition.topic, topicAndPartition.partition).isEmpty
+      )
+      // 处理未知的partition的状态。
+      val unknownStatus = unknownTopicPartitions.map(topicAndPartition => (topicAndPartition, OffsetMetadataAndError.UnknownTopicOrPartition)).toMap
+      val knownStatus = {
+        if (knownTopicPartitions.nonEmpty) {
+          // 通过offsetManager 获取 <TopicAndPartition> -> offset
+          offsetManager.getOffsets(offsetFetchRequest.groupId, knownTopicPartitions).toMap
+        } else
+          Map.empty[TopicAndPartition, OffsetMetadataAndError]
+      }
+      val status = unknownStatus ++ knownStatus
+
+      val response = OffsetFetchResponse(status, offsetFetchRequest.correlationId)
+
+      trace("Sending offset fetch response %s for correlation id %d to client %s."
+            .format(response, offsetFetchRequest.correlationId, offsetFetchRequest.clientId))
+      requestChannel.sendResponse(new RequestChannel.Response(request, new BoundedByteBufferSend(response)))
+    }
+  }
+```
+
+##### 4.3.5.11 ConsumerMetadataRequest
+
+> group 的 offset 存在 __consumer_offset 的某个分区里，当客户端想要知道某个 group 在某个特定的分区的状态时会发送此请求；
+>
+> broker 收到请求后向客户端回复对应的 leader Broker。
+
+```scala
+  def handleConsumerMetadataRequest(request: RequestChannel.Request): Unit = {
+    val consumerMetadataRequest = request.requestObj.asInstanceOf[ConsumerMetadataRequest]
+
+    // 获取对应分区
+    val partition = offsetManager.partitionFor(consumerMetadataRequest.group)
+
+    // get metadata (and create the topic if necessary)
+    val offsetsTopicMetadata = getTopicMetadata(Set(OffsetManager.OffsetsTopicName)).head
+
+    val errorResponse = ConsumerMetadataResponse(None, ErrorMapping.ConsumerCoordinatorNotAvailableCode, consumerMetadataRequest.correlationId)
+
+    val response = {
+      // 找到我们想要查询的分区的metadata，并将metadata中保存的分区leader返回
+      offsetsTopicMetadata.partitionsMetadata.find(_.partitionId == partition).map { partitionMetadata =>
+        partitionMetadata.leader.map { leader =>
+          ConsumerMetadataResponse(Some(leader), ErrorMapping.NoError, consumerMetadataRequest.correlationId)
+        }.getOrElse(errorResponse)
+      }.getOrElse(errorResponse)
+    }
+
+    trace("Sending consumer metadata %s for correlation id %d to client %s."
+          .format(response, consumerMetadataRequest.correlationId, consumerMetadataRequest.clientId))
+    requestChannel.sendResponse(new RequestChannel.Response(request, new BoundedByteBufferSend(response)))
+  }
+```
 
 
 

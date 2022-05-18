@@ -305,6 +305,7 @@ class ReplicaManager(val config: KafkaConfig,
 
   def maybeUpdateMetadataCache(updateMetadataRequest: UpdateMetadataRequest, metadataCache: MetadataCache): Unit = {
     replicaStateChangeLock synchronized {
+      // 如果该请求的 epoch 小于已经当前的 epoch，那么本次请求无效。
       if(updateMetadataRequest.controllerEpoch < controllerEpoch) {
         val stateControllerEpochErrorMessage = ("Broker %d received update metadata request with correlation id %d from an " +
           "old controller %d with epoch %d. Latest known controller epoch is %d").format(localBrokerId,
@@ -313,7 +314,11 @@ class ReplicaManager(val config: KafkaConfig,
         stateChangeLogger.warn(stateControllerEpochErrorMessage)
         throw new ControllerMovedException(stateControllerEpochErrorMessage)
       } else {
+        // 更新 <MetadataCache>，<MetadataCache> 保存了
+        // 1. aliveBrokers 在线的 broker
+        // 2. mutable.Map[String, mutable.Map[Int, PartitionStateInfo]] 保存了 topic -> [partitionId -> PartitionStateInfo] 的详细信息
         metadataCache.updateCache(updateMetadataRequest, localBrokerId, stateChangeLogger)
+        //  更新 epoch
         controllerEpoch = updateMetadataRequest.controllerEpoch
       }
     }

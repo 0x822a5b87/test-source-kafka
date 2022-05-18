@@ -224,6 +224,7 @@ class KafkaController(val config : KafkaConfig, zkClient: ZkClient, val brokerSt
    */
   def shutdownBroker(id: Int) : Set[TopicAndPartition] = {
 
+    // controller 必须存活且是leader
     if (!isActive()) {
       throw new ControllerMovedException("Controller moved to another broker. Aborting controlled shutdown")
     }
@@ -232,14 +233,18 @@ class KafkaController(val config : KafkaConfig, zkClient: ZkClient, val brokerSt
       info("Shutting down broker " + id)
 
       inLock(controllerContext.controllerLock) {
+        // 如果 broker 不可用直接抛出异常
         if (!controllerContext.liveOrShuttingDownBrokerIds.contains(id))
           throw new BrokerNotAvailableException("Broker id %d does not exist.".format(id))
 
+        // 将broker添加到下线broker名单中
         controllerContext.shuttingDownBrokerIds.add(id)
         debug("All shutting down brokers: " + controllerContext.shuttingDownBrokerIds.mkString(","))
         debug("Live brokers: " + controllerContext.liveBrokerIds.mkString(","))
       }
 
+      // 查询某台broker上的 [<TopicAndPartition> -> Replica数(replicationFactor)] 的映射关系
+      // 我们需要知道某一个 <TopicAndPartition> 的副本数，因为这台 broker 上的 leader 和 follower 都需要处理
       val allPartitionsAndReplicationFactorOnBroker: Set[(TopicAndPartition, Int)] =
         inLock(controllerContext.controllerLock) {
           controllerContext.partitionsOnBroker(id)
@@ -251,13 +256,15 @@ class KafkaController(val config : KafkaConfig, zkClient: ZkClient, val brokerSt
           // Move leadership serially to relinquish lock.
           inLock(controllerContext.controllerLock) {
             controllerContext.partitionLeadershipInfo.get(topicAndPartition).foreach { currLeaderIsrAndControllerEpoch =>
+              // 对于某一个在本台 broker 的 <TopicAndPartition>，如果他的副本数大于1
               if (replicationFactor > 1) {
                 if (currLeaderIsrAndControllerEpoch.leaderAndIsr.leader == id) {
-                  // If the broker leads the topic partition, transition the leader and update isr. Updates zk and
-                  // notifies all affected brokers
+                  // 如果该broker是leader，转移leader并且更新ISR。更新zookeeper并且通知所有受影响的broker
+                  // 将 topicAndPartition 对应的状态设置为 Online
                   partitionStateMachine.handleStateChanges(Set(topicAndPartition), OnlinePartition,
                     controlledShutdownPartitionLeaderSelector)
                 } else {
+                  // 先停止副本。 下面的状态更改会启动 ZK 更改，这需要一段时间才能完成停止副本请求（在大多数情况下）
                   // Stop the replica first. The state change below initiates ZK changes which should take some time
                   // before which the stop replica request should be completed (in most cases)
                   brokerRequestBatch.newBatch()
@@ -273,12 +280,14 @@ class KafkaController(val config : KafkaConfig, zkClient: ZkClient, val brokerSt
             }
           }
       }
+
+      // 返回所有在本台broker上的partition的leader并且副本数大于1的partition
       def replicatedPartitionsBrokerLeads() = inLock(controllerContext.controllerLock) {
         trace("All leaders = " + controllerContext.partitionLeadershipInfo.mkString(","))
         controllerContext.partitionLeadershipInfo.filter {
           case (topicAndPartition, leaderIsrAndControllerEpoch) =>
             leaderIsrAndControllerEpoch.leaderAndIsr.leader == id && controllerContext.partitionReplicaAssignment(topicAndPartition).size > 1
-        }.map(_._1)
+        }.keys
       }
       replicatedPartitionsBrokerLeads().toSet
     }

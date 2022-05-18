@@ -77,18 +77,20 @@ class KafkaApis(val requestChannel: RequestChannel,
       request.apiLocalCompleteTimeMs = SystemTime.milliseconds
   }
 
-  def handleOffsetCommitRequest(request: RequestChannel.Request) {
+  def handleOffsetCommitRequest(request: RequestChannel.Request): Unit = {
     val offsetCommitRequest = request.requestObj.asInstanceOf[OffsetCommitRequest]
     if (offsetCommitRequest.versionId == 0) {
       // version 0 stores the offsets in ZK
       val responseInfo = offsetCommitRequest.requestInfo.map{
         case (topicAndPartition, metaAndError) => {
+          // 构建提交的offset在zk中的文件目录
           val topicDirs = new ZKGroupTopicDirs(offsetCommitRequest.groupId, topicAndPartition.topic)
           try {
             ensureTopicExists(topicAndPartition.topic)
             if(metaAndError.metadata != null && metaAndError.metadata.length > config.offsetMetadataMaxSize) {
               (topicAndPartition, ErrorMapping.OffsetMetadataTooLargeCode)
             } else {
+              // 持久化consumer offset到zk
               ZkUtils.updatePersistentPath(zkClient, topicDirs.consumerOffsetDir + "/" +
                 topicAndPartition.partition, metaAndError.offset.toString)
               (topicAndPartition, ErrorMapping.NoError)
@@ -140,7 +142,7 @@ class KafkaApis(val requestChannel: RequestChannel,
     replicaManager.replicaFetcherManager.shutdownIdleFetcherThreads()
   }
 
-  def handleUpdateMetadataRequest(request: RequestChannel.Request) {
+  def handleUpdateMetadataRequest(request: RequestChannel.Request): Unit = {
     val updateMetadataRequest = request.requestObj.asInstanceOf[UpdateMetadataRequest]
     replicaManager.maybeUpdateMetadataCache(updateMetadataRequest, metadataCache)
 
@@ -148,11 +150,9 @@ class KafkaApis(val requestChannel: RequestChannel,
     requestChannel.sendResponse(new Response(request, new BoundedByteBufferSend(updateMetadataResponse)))
   }
 
-  def handleControlledShutdownRequest(request: RequestChannel.Request) {
-    // ensureTopicExists is only for client facing requests
-    // We can't have the ensureTopicExists check here since the controller sends it as an advisory to all brokers so they
-    // stop serving data to clients for the topic being deleted
+  def handleControlledShutdownRequest(request: RequestChannel.Request): Unit = {
     val controlledShutdownRequest = request.requestObj.asInstanceOf[ControlledShutdownRequest]
+    // 关闭 brokerId 对应的 broker
     val partitionsRemaining = controller.shutdownBroker(controlledShutdownRequest.brokerId)
     val controlledShutdownResponse = new ControlledShutdownResponse(controlledShutdownRequest.correlationId,
       ErrorMapping.NoError, partitionsRemaining)
@@ -624,7 +624,7 @@ class KafkaApis(val requestChannel: RequestChannel,
   /*
    * Service the Offset fetch API
    */
-  def handleOffsetFetchRequest(request: RequestChannel.Request) {
+  def handleOffsetFetchRequest(request: RequestChannel.Request): Unit = {
     val offsetFetchRequest = request.requestObj.asInstanceOf[OffsetFetchRequest]
 
     if (offsetFetchRequest.versionId == 0) {
@@ -633,8 +633,10 @@ class KafkaApis(val requestChannel: RequestChannel,
         val topicDirs = new ZKGroupTopicDirs(offsetFetchRequest.groupId, t.topic)
         try {
           ensureTopicExists(t.topic)
+          // 拼接zk path并且读取数据
           val payloadOpt = ZkUtils.readDataMaybeNull(zkClient, topicDirs.consumerOffsetDir + "/" + t.partition)._1
           payloadOpt match {
+            // 如果读取导数据，则返回 <TopicAndPartition> -> offset 的映射关系
             case Some(payload) => {
               (t, OffsetMetadataAndError(offset=payload.toLong, error=ErrorMapping.NoError))
             }
@@ -647,19 +649,24 @@ class KafkaApis(val requestChannel: RequestChannel,
               ErrorMapping.codeFor(e.getClass.asInstanceOf[Class[Throwable]])))
         }
       })
+      // 返回结果
       val response = new OffsetFetchResponse(collection.immutable.Map(responseInfo: _*), offsetFetchRequest.correlationId)
       requestChannel.sendResponse(new RequestChannel.Response(request, new BoundedByteBufferSend(response)))
     } else {
       // version 1 reads offsets from Kafka
+      // 通过读取 metadataCache，我们可以知道哪些<TopicAndPartition> 当前是已有的。
       val (unknownTopicPartitions, knownTopicPartitions) = offsetFetchRequest.requestInfo.partition(topicAndPartition =>
         metadataCache.getPartitionInfo(topicAndPartition.topic, topicAndPartition.partition).isEmpty
       )
+      // 处理未知的partition的状态。
       val unknownStatus = unknownTopicPartitions.map(topicAndPartition => (topicAndPartition, OffsetMetadataAndError.UnknownTopicOrPartition)).toMap
-      val knownStatus =
-        if (knownTopicPartitions.size > 0)
+      val knownStatus = {
+        if (knownTopicPartitions.nonEmpty) {
+          // 通过offsetManager 获取 <TopicAndPartition> -> offset
           offsetManager.getOffsets(offsetFetchRequest.groupId, knownTopicPartitions).toMap
-        else
+        } else
           Map.empty[TopicAndPartition, OffsetMetadataAndError]
+      }
       val status = unknownStatus ++ knownStatus
 
       val response = OffsetFetchResponse(status, offsetFetchRequest.correlationId)
@@ -673,9 +680,10 @@ class KafkaApis(val requestChannel: RequestChannel,
   /*
    * Service the consumer metadata API
    */
-  def handleConsumerMetadataRequest(request: RequestChannel.Request) {
+  def handleConsumerMetadataRequest(request: RequestChannel.Request): Unit = {
     val consumerMetadataRequest = request.requestObj.asInstanceOf[ConsumerMetadataRequest]
 
+    // 获取对应分区
     val partition = offsetManager.partitionFor(consumerMetadataRequest.group)
 
     // get metadata (and create the topic if necessary)
@@ -683,12 +691,14 @@ class KafkaApis(val requestChannel: RequestChannel,
 
     val errorResponse = ConsumerMetadataResponse(None, ErrorMapping.ConsumerCoordinatorNotAvailableCode, consumerMetadataRequest.correlationId)
 
-    val response =
+    val response = {
+      // 找到我们想要查询的分区的metadata，并将metadata中保存的分区leader返回
       offsetsTopicMetadata.partitionsMetadata.find(_.partitionId == partition).map { partitionMetadata =>
         partitionMetadata.leader.map { leader =>
           ConsumerMetadataResponse(Some(leader), ErrorMapping.NoError, consumerMetadataRequest.correlationId)
         }.getOrElse(errorResponse)
       }.getOrElse(errorResponse)
+    }
 
     trace("Sending consumer metadata %s for correlation id %d to client %s."
           .format(response, consumerMetadataRequest.correlationId, consumerMetadataRequest.clientId))
