@@ -270,27 +270,30 @@ object ZkUtils extends Logging {
    * otherwise re-throw the exception
    */
   def createEphemeralPathExpectConflictHandleZKBug(zkClient: ZkClient, path: String, data: String, expectedCallerData: Any, checker: (String, Any) => Boolean, backoffTime: Int): Unit = {
+    // 在 while 循环中尝试，因为zk的bug，ephemeral node 可能在session expired之后继续存活
     while (true) {
       try {
+        // 注册节点，如果注册成功则直接返回
         createEphemeralPathExpectConflict(zkClient, path, data)
         return
       } catch {
         case e: ZkNodeExistsException => {
-          // An ephemeral node may still exist even after its corresponding session has expired
-          // due to a Zookeeper bug, in this case we need to retry writing until the previous node is deleted
-          // and hence the write succeeds without ZkNodeExistsException
           ZkUtils.readDataMaybeNull(zkClient, path)._1 match {
+            // 如果能读到数据，说明节点还存在：
             case Some(writtenData) => {
+              // 实际数据和写入数据一致，说明是同一个客户端不同的旧连接的数据没有被释放，需要等待其被释放后重试。
               if (checker(writtenData, expectedCallerData)) {
                 info("I wrote this conflicted ephemeral node [%s] at %s a while back in a different session, ".format(data, path)
                   + "hence I will backoff for this node to be deleted by Zookeeper and retry")
 
                 Thread.sleep(backoffTime)
               } else {
+                // 实际数据和写入数据不一致，说明已经被其他的客户端抢占
                 throw e
               }
             }
-            case None => // the node disappeared; retry creating the ephemeral node immediately
+            // 如果读不到数据，说明节点已经不存在了，尝试重新创建 ephemeral node
+            case None =>
           }
         }
         case e2: Throwable => throw e2

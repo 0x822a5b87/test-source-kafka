@@ -8,6 +8,7 @@
 
 1. [broker概述](./ch03.md)
 2. [broker的基本模块](./ch04.md)
+3. [broker的控制管理模块](./ch05.md)
 
 ## 编译
 
@@ -212,4 +213,98 @@
 >`KafkaApis#handleOffsetFetchRequest` -> `OffsetManager#getOffsets`，本方法只有在 `KafkaApis#handleOffsetFetchRequest` 中会调用，而这个调用则来自于 `RequestChannel` 中取出的 `Request`。
 >
 >controller 只会向 leader 发送这个消息。
+
+### ZkUtils#createEphemeralPathExpectConflictHandleZKBug 中为何需要在 while(true) 循环中进行重试
+
+>`ZkUtils#createEphemeralPathExpectConflictHandleZKBug` 会在三种情况下被调用：
+>
+>- ZookeeperLeaderElector#elect 该函数使用当前broker进行leader选举
+>- ZkUtils#registerBrokerInZk 该函数将 brokerId 注册到 zk 的 `/brokers/ids/[id]`
+>- ZookeeperConsumerConnector#registerConsumerInZK 注册消费者到 zk
+>
+>**当zk客户端 session expire 时，zk 集群会释放之前创建的瞬时节点，如果此时zk由于某种原因挂起（hang），此时瞬时节点的删除会延迟。**当时当 zk 客户端重连成功的时候，会认为之前创建的节点已经删除，就会去重新创建，**此时会抛出 NodeExistException，为此 `createEphemeralPathExpectConflictHandleZKBug` 方法使用了一个策略。**即在 while 循环中去重试，当实际数据和写入数据一致时，说明是同一个客户端的旧连接数据未清理，需要等到其被释放后重试。
+>
+>```scala
+>  def createEphemeralPathExpectConflictHandleZKBug(zkClient: ZkClient, path: String, data: String, expectedCallerData: Any, checker: (String, Any) => Boolean, backoffTime: Int): Unit = {
+>    // 在 while 循环中尝试，因为zk的bug，ephemeral node 可能在session expired之后继续存活
+>    while (true) {
+>      try {
+>        // 注册节点，如果注册成功则直接返回
+>        createEphemeralPathExpectConflict(zkClient, path, data)
+>        return
+>      } catch {
+>        case e: ZkNodeExistsException => {
+>          ZkUtils.readDataMaybeNull(zkClient, path)._1 match {
+>            // 如果能读到数据，说明节点还存在：
+>            case Some(writtenData) => {
+>              // 实际数据和写入数据一致，说明是同一个客户端不同的旧连接的数据没有被释放，需要等待其被释放后重试。
+>              if (checker(writtenData, expectedCallerData)) {
+>                info("I wrote this conflicted ephemeral node [%s] at %s a while back in a different session, ".format(data, path)
+>                  + "hence I will backoff for this node to be deleted by Zookeeper and retry")
+>
+>                Thread.sleep(backoffTime)
+>              } else {
+>                // 实际数据和写入数据不一致，说明已经被其他的客户端抢占
+>                throw e
+>              }
+>            }
+>            // 如果读不到数据，说明节点已经不存在了，尝试重新创建 ephemeral node
+>            case None =>
+>          }
+>        }
+>        case e2: Throwable => throw e2
+>      }
+>    }
+>  }
+>```
+>
+>`ZookeeperLeaderElector#elect`：在这里，brokerId 作为 expectedValue，如果返回值与 brokerId 相同的话说明 brokerId 就是 leader，继续尝试成为leader，否则退出循环（也就是退出leader选举）。
+>
+>```scala
+>      createEphemeralPathExpectConflictHandleZKBug(controllerContext.zkClient, electionPath, electString, brokerId,
+>        (controllerString : String, leaderId : Any) => KafkaController.parseControllerId(controllerString) == leaderId.asInstanceOf[Int],
+>        controllerContext.zkSessionTimeout)
+>```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
