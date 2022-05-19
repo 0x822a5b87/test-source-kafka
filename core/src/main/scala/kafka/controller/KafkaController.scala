@@ -306,35 +306,45 @@ class KafkaController(val config : KafkaConfig, zkClient: ZkClient, val brokerSt
    * If it encounters any unexpected exception/error while becoming controller, it resigns as the current controller.
    * This ensures another controller election will be triggered and there will always be an actively serving controller
    */
-  def onControllerFailover() {
+  def onControllerFailover(): Unit = {
+    // 判断controller的状态，当 KafkaServer#shutdown 调用时，会设置 isRunning = false
     if(isRunning) {
       info("Broker %d starting become controller state transition".format(config.brokerId))
-      //read controller epoch from zk
+      // 从zk中读取epoch和epochZkVersion到ControllerContext
       readControllerEpochFromZookeeper()
-      // increment the controller epoch
+      // 更新zk中的epoch
       incrementControllerEpoch(zkClient)
-      // before reading source of truth from zookeeper, register the listeners to get broker/topic callbacks
+      // 在 /admin/reassign_partitions 注册监听器，监听 partition 重新分配的事件
       registerReassignedPartitionsListener()
+      // 在 /admin/preferred_replica_election 注册监听器，监听 replica 选举事件
       registerPreferredReplicaElectionListener()
+      // 初始化 partition 状态机并注册监听器
       partitionStateMachine.registerListeners()
+      // 初始化 replica 状态机并注册监听器
       replicaStateMachine.registerListeners()
+      // 初始化ControllerContext
       initializeControllerContext()
+      // 启动 replica 状态机
       replicaStateMachine.startup()
+      // 启动 partition 状态机
       partitionStateMachine.startup()
       // register the partition change listeners for all existing topics on failover
       controllerContext.allTopics.foreach(topic => partitionStateMachine.registerPartitionChangeListener(topic))
       info("Broker %d is ready to serve as the new controller with epoch %d".format(config.brokerId, epoch))
       brokerState.newState(RunningAsController)
+      // 处理集群初始化之前用户下发的 `PartitionReassignment` 和 `PreferredReplicaElection` 请求；
       maybeTriggerPartitionReassignment()
       maybeTriggerPreferredReplicaElection()
       /* send partition leadership info to all live brokers */
       sendUpdateMetadataRequest(controllerContext.liveOrShuttingDownBrokerIds.toSeq)
+      // 启动kafka负载均衡机制
       if (config.autoLeaderRebalanceEnable) {
         info("starting the partition rebalance scheduler")
         autoRebalanceScheduler.startup()
         autoRebalanceScheduler.schedule("partition-rebalance-thread", checkAndTriggerPartitionRebalance,
           5, config.leaderImbalanceCheckIntervalSeconds, TimeUnit.SECONDS)
       }
+      // 启动TopicDeletionManager
       deleteTopicManager.start()
     }
     else
@@ -345,7 +355,7 @@ class KafkaController(val config : KafkaConfig, zkClient: ZkClient, val brokerSt
    * This callback is invoked by the zookeeper leader elector when the current broker resigns as the controller. This is
    * required to clean up internal controller data structures
    */
-  def onControllerResignation() {
+  def onControllerResignation(): Unit = {
     // de-register listeners
     deregisterReassignedPartitionsListener()
     deregisterPreferredReplicaElectionListener()
@@ -677,7 +687,9 @@ class KafkaController(val config : KafkaConfig, zkClient: ZkClient, val brokerSt
     controllerContext.controllerChannelManager.sendRequest(brokerId, request, callback)
   }
 
-  def incrementControllerEpoch(zkClient: ZkClient) = {
+  // 更新epoch时，我们先将epoch写入到zk，再更新ControllerContext
+  // 这样可以保证，即使我们在更新zk之后立即宕机，新选出来的controller可以拿到正确的epoch
+  def incrementControllerEpoch(zkClient: ZkClient): Unit = {
     try {
       var newControllerEpoch = controllerContext.epoch + 1
       val (updateSucceeded, newVersion) = ZkUtils.conditionalUpdatePersistentPathIfExists(zkClient,
@@ -918,7 +930,7 @@ class KafkaController(val config : KafkaConfig, zkClient: ZkClient, val brokerSt
     }
   }
 
-  private def readControllerEpochFromZookeeper() {
+  private def readControllerEpochFromZookeeper(): Unit = {
     // initialize the controller epoch and zk version by reading from zookeeper
     if(ZkUtils.pathExists(controllerContext.zkClient, ZkUtils.ControllerEpochPath)) {
       val epochData = ZkUtils.readData(controllerContext.zkClient, ZkUtils.ControllerEpochPath)
