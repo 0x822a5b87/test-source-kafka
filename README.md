@@ -266,9 +266,246 @@
 >        controllerContext.zkSessionTimeout)
 >```
 
+### kafka 创建 topic 的实际流程是怎么样的？
 
+> kafka 创建 topic 在 `AdminUtils#createTopic` 下实现，而有以下几种情况可能会创建 topic：
+>
+> - 在 `TopicCommand#createTopic` 下被调用；
+> - 开启了 `autoCreateTopic` 的状态下，在处理 `ConsumerMetadataRequest`、`TopicMetadataRequest` 时会自动的创建 topic；
+>
+> 我们以 `TopicCommand#createTopic` 为例说明。
 
+#### TopicCommand#createTopic
 
+> TopicCommand#createTopic 接收命令行脚本的命令，并创建topic
+
+```scala
+  def createTopic(zkClient: ZkClient, opts: TopicCommandOptions): Unit = {
+    val topic = opts.options.valueOf(opts.topicOpt)
+    val configs = parseTopicConfigsToBeAdded(opts)
+    if (opts.options.has(opts.replicaAssignmentOpt)) {
+      // 手动的分配 partition -> broker
+      val assignment = parseReplicaAssignment(opts.options.valueOf(opts.replicaAssignmentOpt))
+      AdminUtils.createOrUpdateTopicPartitionAssignmentPathInZK(zkClient, topic, assignment, configs)
+    } else {
+      // 只指定partition count和replica count，由controller自动创建
+      CommandLineUtils.checkRequiredArgs(opts.parser, opts.options, opts.partitionsOpt, opts.replicationFactorOpt)
+      val partitions = opts.options.valueOf(opts.partitionsOpt).intValue
+      val replicas = opts.options.valueOf(opts.replicationFactorOpt).intValue
+      AdminUtils.createTopic(zkClient, topic, partitions, replicas, configs)
+    }
+    println("Created topic \"%s\".".format(topic))
+  }
+```
+
+#### AdminUtils#createTopic
+
+```scala
+  def createTopic(zkClient: ZkClient,
+                  topic: String,
+                  partitions: Int, 
+                  replicationFactor: Int, 
+                  topicConfig: Properties = new Properties): Unit = {
+    // 获取排序后的 brokerId 列表
+    val brokerList = ZkUtils.getSortedBrokerList(zkClient)
+    // 使用特定的算法，将replica放到不同的broker上
+    val replicaAssignment = AdminUtils.assignReplicasToBrokers(brokerList, partitions, replicationFactor)
+    // 根据我们刚才分配好的brokerId->[replicas0, replicas1, ...]在zookeeper上注册节点
+    AdminUtils.createOrUpdateTopicPartitionAssignmentPathInZK(zkClient, topic, replicaAssignment, topicConfig)
+  }
+```
+
+#### AdminUtils#assignReplicasToBrokers
+
+> assignReplicasToBrokers 有两个诉求：
+>
+> 1. 均匀的将replicas分配到所有的broker；
+> 2. 对于分布到某个broker的replica，其他的replica应该尽量分配到其他的broker上；
+>
+> 实际算法是这样的：
+>
+> 1. 随机选取一台broker，将partition以round-robin的方式递增的去分配到broker列表；
+> 2. 选中在上一次分配中选中的broker的下一台broker（incresing shift），并重复步骤<1>；
+> 3. 如果还有剩余的replica，重复执行步骤<2>；
+>
+> ```
+> * Here is an example of assigning
+> * broker-0  broker-1  broker-2  broker-3  broker-4
+> * p0        p1        p2        p3        p4       (1st replica)
+> * p5        p6        p7        p8        p9       (1st replica)
+> * p4        p0        p1        p2        p3       (2nd replica)
+> * p8        p9        p5        p6        p7       (2nd replica)
+> * p3        p4        p0        p1        p2       (3nd replica)
+> * p7        p8        p9        p5        p6       (3nd replica)
+> ```
+
+```scala
+  /**
+   * There are 2 goals of replica assignment:
+   * 1. Spread the replicas evenly among brokers.
+   * 2. For partitions assigned to a particular broker, their other replicas are spread over the other brokers.
+   *
+   * To achieve this goal, we:
+   * 1. Assign the first replica of each partition by round-robin, starting from a random position in the broker list.
+   * 2. Assign the remaining replicas of each partition with an increasing shift.
+   *
+   * Here is an example of assigning
+   * broker-0  broker-1  broker-2  broker-3  broker-4
+   * p0        p1        p2        p3        p4       (1st replica)
+   * p5        p6        p7        p8        p9       (1st replica)
+   * p4        p0        p1        p2        p3       (2nd replica)
+   * p8        p9        p5        p6        p7       (2nd replica)
+   * p3        p4        p0        p1        p2       (3nd replica)
+   * p7        p8        p9        p5        p6       (3nd replica)
+   */
+  def assignReplicasToBrokers(brokerList: Seq[Int],
+                              nPartitions: Int,
+                              replicationFactor: Int,
+                              fixedStartIndex: Int = -1,
+                              startPartitionId: Int = -1)
+  : Map[Int, Seq[Int]] = {
+    if (nPartitions <= 0)
+      throw new AdminOperationException("number of partitions must be larger than 0")
+    if (replicationFactor <= 0)
+      throw new AdminOperationException("replication factor must be larger than 0")
+    if (replicationFactor > brokerList.size)
+      throw new AdminOperationException("replication factor: " + replicationFactor +
+        " larger than available brokers: " + brokerList.size)
+    val ret = new mutable.HashMap[Int, List[Int]]()
+
+    // 参数 fixedStartIndex 和 startPartitionId 是为了在 AdminUtils#addPartition 中能够正确的分配replica
+    // fixedStartIndex  -> existingReplicaList.head
+    // startPartitionId -> existingPartitionsReplicaList.size
+
+    // 选中一台broker作为开始
+    val startIndex = if (fixedStartIndex >= 0) fixedStartIndex else rand.nextInt(brokerList.size)
+    var currentPartitionId = if (startPartitionId >= 0) startPartitionId else 0
+    var nextReplicaShift = if (fixedStartIndex >= 0) fixedStartIndex else rand.nextInt(brokerList.size)
+    for (i <- 0 until nPartitions) {
+      if (currentPartitionId > 0 && (currentPartitionId % brokerList.size == 0))
+        nextReplicaShift += 1
+      val firstReplicaIndex = (currentPartitionId + startIndex) % brokerList.size
+      var replicaList = List(brokerList(firstReplicaIndex))
+      for (j <- 0 until replicationFactor - 1)
+        replicaList ::= brokerList(replicaIndex(firstReplicaIndex, nextReplicaShift, j, brokerList.size))
+      ret.put(currentPartitionId, replicaList.reverse)
+      currentPartitionId = currentPartitionId + 1
+    }
+    ret.toMap
+  }
+
+```
+
+#### AdminUtils#createOrUpdateTopicPartitionAssignmentPathInZK
+
+> 随后，我们将 topic 相关的配置信息写入到 `/brokers/topics/[topic]` 下， `KafkaController` 在启动的时候在这个path上注册了监听函数 `AddPartitionsListener`，写入的信息大概形式如下：
+>
+> ```json
+> {
+>     "version": 1,
+>     "partitions": {
+>         "0": [
+>             0
+>         ],
+>         "1": [
+>             0
+>         ]
+>     }
+> }
+> ```
+
+```scala
+  def createOrUpdateTopicPartitionAssignmentPathInZK(zkClient: ZkClient,
+                                                     topic: String,
+                                                     partitionReplicaAssignment: Map[Int, Seq[Int]],
+                                                     config: Properties = new Properties,
+                                                     update: Boolean = false): Unit = {
+    // validate arguments
+    Topic.validate(topic)
+    LogConfig.validate(config)
+    // 遍历 partitionReplicaAssignment 的 values，并转换为 value.size()，随后将所有的 value.size() 放到一个 set 中
+    // 如果所有的 partition 都有相同的副本数，那么 set.size == 1
+    require(partitionReplicaAssignment.values.map(_.size).toSet.size == 1, "All partitions should have the same number of replicas.")
+
+    // /brokers/topics/[topic]
+    val topicPath = ZkUtils.getTopicPath(topic)
+    if(!update && zkClient.exists(topicPath))
+      throw new TopicExistsException("Topic \"%s\" already exists.".format(topic))
+    // 不能存在相同的分区
+    partitionReplicaAssignment.values.foreach(reps => require(reps.size == reps.toSet.size, "Duplicate replica assignment found: "  + partitionReplicaAssignment))
+    
+    // 将配置文件写入到 /config/topics/[topic] 内
+    writeTopicConfig(zkClient, topic, config)
+    
+    // 将 [topic] 相关的 partition 信息写入到节点 /brokers/topics/[topic] 中
+    // get /brokers/topics/test
+    // {"version":1,"partitions":{"12":[0],"8":[0],"19":[0],"4":[0],"15":[0],"11":[0],"9":[0],"13":[0],"16":[0],"5":[0],"10":[0],"21":[0],"6":[0],"1":[0],"17":[0],"14":[0],"0":[0],"20":[0],"2":[0],"18":[0],"7":[0],"3":[0]}}
+    writeTopicPartitionAssignment(zkClient, topic, partitionReplicaAssignment, update)
+  }
+```
+
+#### PartitionStateMachine#AddPartitionsListener
+
+> AddPartitionsListener 监听了 `/brokers/topics/[topic]`，并且执行了创建新分区的操作。
+
+```scala
+  class AddPartitionsListener(topic: String) extends IZkDataListener with Logging {
+
+    this.logIdent = "[AddPartitionsListener on " + controller.config.brokerId + "]: "
+
+    @throws(classOf[Exception])
+    def handleDataChange(dataPath : String, data: Object): Unit = {
+      inLock(controllerContext.controllerLock) {
+        try {
+          info("Add Partition triggered " + data.toString + " for path " + dataPath)
+          // 读取 /brokers/topics/[topic] 中的数据并解析成 Map[TopicAndPartition, Seq[Int]]
+          val partitionReplicaAssignment = ZkUtils.getReplicaAssignmentForTopics(zkClient, List(topic))
+          // 如果当前RA已经包含了这个replica，那么直接跳过
+          val partitionsToBeAdded = partitionReplicaAssignment.filter(p =>
+            !controllerContext.partitionReplicaAssignment.contains(p._1))
+          // 如果topic已经被删除了，那么抛出异常
+          if(controller.deleteTopicManager.isTopicQueuedUpForDeletion(topic)) {
+            error("Skipping adding partitions %s for topic %s since it is currently being deleted"
+                  .format(partitionsToBeAdded.map(_._1.partition).mkString(","), topic))
+          } else {
+            if (partitionsToBeAdded.nonEmpty) {
+              info("New partitions to be added %s".format(partitionsToBeAdded))
+              // 创建新分区
+              controller.onNewPartitionCreation(partitionsToBeAdded.keySet.toSet)
+            }
+          }
+        } catch {
+          case e: Throwable => error("Error while handling add partitions for data path " + dataPath, e )
+        }
+      }
+    }
+
+    @throws(classOf[Exception])
+    def handleDataDeleted(parentPath : String): Unit = {
+      // this is not implemented for partition change
+    }
+  }
+```
+
+#### KafkaController#onNewPartitionCreation
+
+> 最后执行新建partition的操作。
+
+```scala
+  /**
+   * This callback is invoked by the topic change callback with the list of failed brokers as input.
+   * It does the following -
+   * 1. Move the newly created partitions to the NewPartition state
+   * 2. Move the newly created partitions from NewPartition->OnlinePartition state
+   */
+  def onNewPartitionCreation(newPartitions: Set[TopicAndPartition]): Unit = {
+    info("New partition creation callback for %s".format(newPartitions.mkString(",")))
+    partitionStateMachine.handleStateChanges(newPartitions, NewPartition)
+    replicaStateMachine.handleStateChanges(controllerContext.replicasForPartition(newPartitions), NewReplica)
+    partitionStateMachine.handleStateChanges(newPartitions, OnlinePartition, offlinePartitionSelector)
+    replicaStateMachine.handleStateChanges(controllerContext.replicasForPartition(newPartitions), OnlineReplica)
+  }
+```
 
 
 
