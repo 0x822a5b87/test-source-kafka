@@ -444,7 +444,80 @@
   }
 ```
 
-#### PartitionStateMachine#AddPartitionsListener
+#### PartitionStateMachine#TopicChangeListener
+
+> TopicChangeListener 监听了 `/brokers/topics` 的子目录变更，他会负责处理创建topic，删除topic的变更。
+>
+> 可以看到 TopicChangeListener 主要负责几个事情：
+>
+> 1. 响应创建/删除topic事件；
+> 2. 维护ControllerContext 内的 RA 信息；
+
+```scala
+  /**
+   * This is the zookeeper listener that triggers all the state transitions for a partition
+   */
+  class TopicChangeListener extends IZkChildListener with Logging {
+    this.logIdent = "[TopicChangeListener on Controller " + controller.config.brokerId + "]: "
+
+    @throws(classOf[Exception])
+    def handleChildChange(parentPath : String, children : java.util.List[String]): Unit = {
+      inLock(controllerContext.controllerLock) {
+        if (hasStarted.get) {
+          try {
+            // 将 /brokers/topics 的子目录转换成 set
+            val currentChildren = {
+              import JavaConversions._
+              debug("Topic change listener fired for path %s with children %s".format(parentPath, children.mkString(",")))
+              (children: Buffer[String]).toSet
+            }
+            // 得到新建的topic
+            val newTopics = currentChildren -- controllerContext.allTopics
+            // 得到删除的topic
+            val deletedTopics = controllerContext.allTopics -- currentChildren
+            // 修改当前的所有topics
+            controllerContext.allTopics = currentChildren
+
+            val addedPartitionReplicaAssignment = ZkUtils.getReplicaAssignmentForTopics(zkClient, newTopics.toSeq)
+            // 在RA中删除deletedTopics
+            controllerContext.partitionReplicaAssignment = controllerContext.partitionReplicaAssignment.filter(p =>
+              !deletedTopics.contains(p._1.topic))
+            // 在RA中添加新创建的topics对应的RA
+            controllerContext.partitionReplicaAssignment.++=(addedPartitionReplicaAssignment)
+            info("New topics: [%s], deleted topics: [%s], new partition replica assignment [%s]".format(newTopics,
+              deletedTopics, addedPartitionReplicaAssignment))
+            if(newTopics.nonEmpty) {
+              // 创建新的topic
+              controller.onNewTopicCreation(newTopics, addedPartitionReplicaAssignment.keySet.toSet)
+            }
+          } catch {
+            case e: Throwable => error("Error while handling new topic", e )
+          }
+        }
+      }
+    }
+  }
+```
+
+#### PartitionStateMachine#onTopicCreation
+
+```scala
+  /**
+   * This callback is invoked by the partition state machine's topic change listener with the list of new topics
+   * and partitions as input. It does the following -
+   * 1. Registers partition change listener. This is not required until KAFKA-347
+   * 2. Invokes the new partition callback
+   * 3. Send metadata request with the new topic to all brokers so they allow requests for that topic to be served
+   */
+  def onNewTopicCreation(topics: Set[String], newPartitions: Set[TopicAndPartition]): Unit = {
+    info("New topic creation callback for %s".format(newPartitions.mkString(",")))
+    // subscribe to partition changes
+    topics.foreach(topic => partitionStateMachine.registerPartitionChangeListener(topic))
+    onNewPartitionCreation(newPartitions)
+  }
+```
+
+#### PartitionStateMachine#TopicChangeListener
 
 > AddPartitionsListener 监听了 `/brokers/topics/[topic]`，并且执行了创建新分区的操作。
 
