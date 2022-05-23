@@ -485,7 +485,7 @@ class KafkaController(val config : KafkaConfig, zkClient: ZkClient, val brokerSt
    * 2. Invokes the new partition callback
    * 3. Send metadata request with the new topic to all brokers so they allow requests for that topic to be served
    */
-  def onNewTopicCreation(topics: Set[String], newPartitions: Set[TopicAndPartition]) {
+  def onNewTopicCreation(topics: Set[String], newPartitions: Set[TopicAndPartition]): Unit = {
     info("New topic creation callback for %s".format(newPartitions.mkString(",")))
     // subscribe to partition changes
     topics.foreach(topic => partitionStateMachine.registerPartitionChangeListener(topic))
@@ -498,7 +498,7 @@ class KafkaController(val config : KafkaConfig, zkClient: ZkClient, val brokerSt
    * 1. Move the newly created partitions to the NewPartition state
    * 2. Move the newly created partitions from NewPartition->OnlinePartition state
    */
-  def onNewPartitionCreation(newPartitions: Set[TopicAndPartition]) {
+  def onNewPartitionCreation(newPartitions: Set[TopicAndPartition]): Unit = {
     info("New partition creation callback for %s".format(newPartitions.mkString(",")))
     partitionStateMachine.handleStateChanges(newPartitions, NewPartition)
     replicaStateMachine.handleStateChanges(controllerContext.replicasForPartition(newPartitions), NewReplica)

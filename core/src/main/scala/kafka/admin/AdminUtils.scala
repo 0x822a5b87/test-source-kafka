@@ -70,9 +70,14 @@ object AdminUtils extends Logging {
       throw new AdminOperationException("replication factor: " + replicationFactor +
         " larger than available brokers: " + brokerList.size)
     val ret = new mutable.HashMap[Int, List[Int]]()
+
+    // 参数 fixedStartIndex 和 startPartitionId 是为了在 AdminUtils#addPartition 中能够正确的分配replica
+    // fixedStartIndex  -> existingReplicaList.head
+    // startPartitionId -> existingPartitionsReplicaList.size
+
+    // 选中一台broker作为开始
     val startIndex = if (fixedStartIndex >= 0) fixedStartIndex else rand.nextInt(brokerList.size)
     var currentPartitionId = if (startPartitionId >= 0) startPartitionId else 0
-
     var nextReplicaShift = if (fixedStartIndex >= 0) fixedStartIndex else rand.nextInt(brokerList.size)
     for (i <- 0 until nPartitions) {
       if (currentPartitionId > 0 && (currentPartitionId % brokerList.size == 0))
@@ -166,9 +171,12 @@ object AdminUtils extends Logging {
                   topic: String,
                   partitions: Int, 
                   replicationFactor: Int, 
-                  topicConfig: Properties = new Properties) {
+                  topicConfig: Properties = new Properties): Unit = {
+    // 获取排序后的 brokerId 列表
     val brokerList = ZkUtils.getSortedBrokerList(zkClient)
+    // 使用特定的算法，将replica放到不同的broker上
     val replicaAssignment = AdminUtils.assignReplicasToBrokers(brokerList, partitions, replicationFactor)
+    // 根据我们刚才分配好的brokerId->[replicas0, replicas1, ...]在zookeeper上注册节点
     AdminUtils.createOrUpdateTopicPartitionAssignmentPathInZK(zkClient, topic, replicaAssignment, topicConfig)
   }
                   
@@ -176,21 +184,27 @@ object AdminUtils extends Logging {
                                                      topic: String,
                                                      partitionReplicaAssignment: Map[Int, Seq[Int]],
                                                      config: Properties = new Properties,
-                                                     update: Boolean = false) {
+                                                     update: Boolean = false): Unit = {
     // validate arguments
     Topic.validate(topic)
     LogConfig.validate(config)
+    // 遍历 partitionReplicaAssignment 的 values，并转换为 value.size()，随后将所有的 value.size() 放到一个 set 中
+    // 如果所有的 partition 都有相同的副本数，那么 set.size == 1
     require(partitionReplicaAssignment.values.map(_.size).toSet.size == 1, "All partitions should have the same number of replicas.")
 
+    // /brokers/topics/[topic]
     val topicPath = ZkUtils.getTopicPath(topic)
     if(!update && zkClient.exists(topicPath))
       throw new TopicExistsException("Topic \"%s\" already exists.".format(topic))
+    // 不能存在相同的分区
     partitionReplicaAssignment.values.foreach(reps => require(reps.size == reps.toSet.size, "Duplicate replica assignment found: "  + partitionReplicaAssignment))
     
-    // write out the config if there is any, this isn't transactional with the partition assignments
+    // 将配置文件写入到 /config/topics/[topic] 内
     writeTopicConfig(zkClient, topic, config)
     
-    // create the partition assignment
+    // 将 [topic] 相关的 partition 信息写入到节点 /brokers/topics/[topic] 中
+    // get /brokers/topics/test
+    // {"version":1,"partitions":{"12":[0],"8":[0],"19":[0],"4":[0],"15":[0],"11":[0],"9":[0],"13":[0],"16":[0],"5":[0],"10":[0],"21":[0],"6":[0],"1":[0],"17":[0],"14":[0],"0":[0],"20":[0],"2":[0],"18":[0],"7":[0],"3":[0]}}
     writeTopicPartitionAssignment(zkClient, topic, partitionReplicaAssignment, update)
   }
   

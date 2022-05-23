@@ -203,16 +203,17 @@ class ControllerBrokerRequestBatch(controller: KafkaController) extends  Logging
         "new one. Some UpdateMetadata state changes %s might be lost ".format(updateMetadataRequestMap.toString()))
   }
 
+  // 添加 LeaderAndIsrRequest 到 leaderAndIsrRequestMap，后台会在合适的时机发送这些 Request 到 broker
+  // 添加 UpdateMetadataRequest
   def addLeaderAndIsrRequestForBrokers(brokerIds: Seq[Int], topic: String, partition: Int,
                                        leaderIsrAndControllerEpoch: LeaderIsrAndControllerEpoch,
-                                       replicas: Seq[Int], callback: (RequestOrResponse) => Unit = null) {
+                                       replicas: Seq[Int], callback: (RequestOrResponse) => Unit = null): Unit = {
     val topicAndPartition: TopicAndPartition = TopicAndPartition(topic, partition)
 
     brokerIds.filter(b => b >= 0).foreach {
       brokerId =>
         leaderAndIsrRequestMap.getOrElseUpdate(brokerId, new mutable.HashMap[(String, Int), PartitionStateInfo])
-        leaderAndIsrRequestMap(brokerId).put((topic, partition),
-          PartitionStateInfo(leaderIsrAndControllerEpoch, replicas.toSet))
+        leaderAndIsrRequestMap(brokerId).put((topic, partition), PartitionStateInfo(leaderIsrAndControllerEpoch, replicas.toSet))
     }
 
     addUpdateMetadataRequestForBrokers(controllerContext.liveOrShuttingDownBrokerIds.toSeq,

@@ -80,13 +80,15 @@ object TopicCommand {
       allTopics
   }
 
-  def createTopic(zkClient: ZkClient, opts: TopicCommandOptions) {
+  def createTopic(zkClient: ZkClient, opts: TopicCommandOptions): Unit = {
     val topic = opts.options.valueOf(opts.topicOpt)
     val configs = parseTopicConfigsToBeAdded(opts)
     if (opts.options.has(opts.replicaAssignmentOpt)) {
+      // 手动的分配 partition -> broker
       val assignment = parseReplicaAssignment(opts.options.valueOf(opts.replicaAssignmentOpt))
       AdminUtils.createOrUpdateTopicPartitionAssignmentPathInZK(zkClient, topic, assignment, configs)
     } else {
+      // 只指定partition count和replica count，由controller自动创建
       CommandLineUtils.checkRequiredArgs(opts.parser, opts.options, opts.partitionsOpt, opts.replicationFactorOpt)
       val partitions = opts.options.valueOf(opts.partitionsOpt).intValue
       val replicas = opts.options.valueOf(opts.replicationFactorOpt).intValue
