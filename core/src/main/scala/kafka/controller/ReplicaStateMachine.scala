@@ -62,7 +62,7 @@ class ReplicaStateMachine(controller: KafkaController) extends Logging {
    * state transitions for replicas. Initializes the state of replicas for all partitions by reading from zookeeper.
    * Then triggers the OnlineReplica state change for all replicas.
    */
-  def startup() {
+  def startup(): Unit = {
     // initialize replica state
     initializeReplicaState()
     // set started flag
@@ -74,7 +74,7 @@ class ReplicaStateMachine(controller: KafkaController) extends Logging {
   }
 
   // register ZK listeners of the replica state machine
-  def registerListeners() {
+  def registerListeners(): Unit = {
     // register broker change listener
     registerBrokerChangeListener()
   }
@@ -106,12 +106,14 @@ class ReplicaStateMachine(controller: KafkaController) extends Logging {
    * The controller's allLeaders cache should have been updated before this
    */
   def handleStateChanges(replicas: Set[PartitionAndReplica], targetState: ReplicaState,
-                         callbacks: Callbacks = (new CallbackBuilder).build) {
-    if(replicas.size > 0) {
+                         callbacks: Callbacks = (new CallbackBuilder).build): Unit = {
+    if(replicas.nonEmpty) {
       info("Invoking state change to %s for replicas %s".format(targetState, replicas.mkString(",")))
       try {
         brokerRequestBatch.newBatch()
+        // 将所有的 replica 修改到 targetState
         replicas.foreach(r => handleStateChange(r, targetState, callbacks))
+        // 发送 LeaderAndIsrRequest、UpdateMetadataRequest、StopReplicaRequest 到 broker
         brokerRequestBatch.sendRequestsToBrokers(controller.epoch, controllerContext.correlationId.getAndIncrement)
       }catch {
         case e: Throwable => error("Error while moving some replicas to %s state".format(targetState), e)
@@ -155,7 +157,7 @@ class ReplicaStateMachine(controller: KafkaController) extends Logging {
    * @param targetState The end state that the replica should be moved to
    */
   def handleStateChange(partitionAndReplica: PartitionAndReplica, targetState: ReplicaState,
-                        callbacks: Callbacks) {
+                        callbacks: Callbacks): Unit = {
     val topic = partitionAndReplica.topic
     val partition = partitionAndReplica.partition
     val replicaId = partitionAndReplica.replica
@@ -164,66 +166,74 @@ class ReplicaStateMachine(controller: KafkaController) extends Logging {
       throw new StateChangeFailedException(("Controller %d epoch %d initiated state change of replica %d for partition %s " +
                                             "to %s failed because replica state machine has not started")
                                               .format(controllerId, controller.epoch, replicaId, topicAndPartition, targetState))
+    // 如果当前replica没有创建则创建一个 NonExistentReplica
     val currState = replicaState.getOrElseUpdate(partitionAndReplica, NonExistentReplica)
     try {
       val replicaAssignment = controllerContext.partitionReplicaAssignment(topicAndPartition)
       targetState match {
-        case NewReplica =>
+        case NewReplica => {
           assertValidPreviousStates(partitionAndReplica, List(NonExistentReplica), targetState)
-          // start replica as a follower to the current leader for its partition
+          // 启动replica作为它分区的当前leader的follower
           val leaderIsrAndControllerEpochOpt = ReplicationUtils.getLeaderIsrAndEpochForPartition(zkClient, topic, partition)
           leaderIsrAndControllerEpochOpt match {
+            // 由于是从 NonExistentReplica 变为 NewReplica，所以此时应该没有 leader
+            // 如果当前 replica 是 leader 则直接抛出异常，否则发送 LeaderAndIsrRequest
             case Some(leaderIsrAndControllerEpoch) =>
-              if(leaderIsrAndControllerEpoch.leaderAndIsr.leader == replicaId)
+              if (leaderIsrAndControllerEpoch.leaderAndIsr.leader == replicaId)
                 throw new StateChangeFailedException("Replica %d for partition %s cannot be moved to NewReplica"
                   .format(replicaId, topicAndPartition) + "state as it is being requested to become leader")
               brokerRequestBatch.addLeaderAndIsrRequestForBrokers(List(replicaId),
-                                                                  topic, partition, leaderIsrAndControllerEpoch,
-                                                                  replicaAssignment)
+                topic, partition, leaderIsrAndControllerEpoch,
+                replicaAssignment)
             case None => // new leader request will be sent to this replica when one gets elected
           }
           replicaState.put(partitionAndReplica, NewReplica)
           stateChangeLogger.trace("Controller %d epoch %d changed state of replica %d for partition %s from %s to %s"
-                                    .format(controllerId, controller.epoch, replicaId, topicAndPartition, currState,
-                                            targetState))
-        case ReplicaDeletionStarted =>
+            .format(controllerId, controller.epoch, replicaId, topicAndPartition, currState,
+              targetState))
+        }
+        case ReplicaDeletionStarted => {
+          // 标记 OfflineReplica 为 ReplicaDeletionStarted 并发送 StopReplicaRequest 到 broker
           assertValidPreviousStates(partitionAndReplica, List(OfflineReplica), targetState)
           replicaState.put(partitionAndReplica, ReplicaDeletionStarted)
-          // send stop replica command
           brokerRequestBatch.addStopReplicaRequestForBrokers(List(replicaId), topic, partition, deletePartition = true,
             callbacks.stopReplicaResponseCallback)
           stateChangeLogger.trace("Controller %d epoch %d changed state of replica %d for partition %s from %s to %s"
             .format(controllerId, controller.epoch, replicaId, topicAndPartition, currState, targetState))
-        case ReplicaDeletionIneligible =>
+        }
+        case ReplicaDeletionIneligible => {
+          // 仅仅标记replica为ReplicaDeletionIneligible
           assertValidPreviousStates(partitionAndReplica, List(ReplicaDeletionStarted), targetState)
           replicaState.put(partitionAndReplica, ReplicaDeletionIneligible)
           stateChangeLogger.trace("Controller %d epoch %d changed state of replica %d for partition %s from %s to %s"
             .format(controllerId, controller.epoch, replicaId, topicAndPartition, currState, targetState))
-        case ReplicaDeletionSuccessful =>
+        }
+        case ReplicaDeletionSuccessful => {
+          // 仅仅标记replica为ReplicaDeletionSuccessful
           assertValidPreviousStates(partitionAndReplica, List(ReplicaDeletionStarted), targetState)
           replicaState.put(partitionAndReplica, ReplicaDeletionSuccessful)
           stateChangeLogger.trace("Controller %d epoch %d changed state of replica %d for partition %s from %s to %s"
             .format(controllerId, controller.epoch, replicaId, topicAndPartition, currState, targetState))
-        case NonExistentReplica =>
+        }
+        case NonExistentReplica => {
           assertValidPreviousStates(partitionAndReplica, List(ReplicaDeletionSuccessful), targetState)
-          // remove this replica from the assigned replicas list for its partition
+          // 删除 replica 在 AR 的信息
           val currentAssignedReplicas = controllerContext.partitionReplicaAssignment(topicAndPartition)
           controllerContext.partitionReplicaAssignment.put(topicAndPartition, currentAssignedReplicas.filterNot(_ == replicaId))
+          // 删除 replica 的 replicaState 信息
           replicaState.remove(partitionAndReplica)
           stateChangeLogger.trace("Controller %d epoch %d changed state of replica %d for partition %s from %s to %s"
             .format(controllerId, controller.epoch, replicaId, topicAndPartition, currState, targetState))
-        case OnlineReplica =>
+        }
+        case OnlineReplica => {
           assertValidPreviousStates(partitionAndReplica,
             List(NewReplica, OnlineReplica, OfflineReplica, ReplicaDeletionIneligible), targetState)
           replicaState(partitionAndReplica) match {
             case NewReplica =>
               // add this replica to the assigned replicas list for its partition
               val currentAssignedReplicas = controllerContext.partitionReplicaAssignment(topicAndPartition)
-              if(!currentAssignedReplicas.contains(replicaId))
+              if (!currentAssignedReplicas.contains(replicaId))
                 controllerContext.partitionReplicaAssignment.put(topicAndPartition, currentAssignedReplicas :+ replicaId)
-              stateChangeLogger.trace("Controller %d epoch %d changed state of replica %d for partition %s from %s to %s"
-                                        .format(controllerId, controller.epoch, replicaId, topicAndPartition, currState,
-                                                targetState))
             case _ =>
               // check if the leader for this partition ever existed
               controllerContext.partitionLeadershipInfo.get(topicAndPartition) match {
@@ -231,14 +241,13 @@ class ReplicaStateMachine(controller: KafkaController) extends Logging {
                   brokerRequestBatch.addLeaderAndIsrRequestForBrokers(List(replicaId), topic, partition, leaderIsrAndControllerEpoch,
                     replicaAssignment)
                   replicaState.put(partitionAndReplica, OnlineReplica)
-                  stateChangeLogger.trace("Controller %d epoch %d changed state of replica %d for partition %s from %s to %s"
-                    .format(controllerId, controller.epoch, replicaId, topicAndPartition, currState, targetState))
                 case None => // that means the partition was never in OnlinePartition state, this means the broker never
-                  // started a log for that partition and does not have a high watermark value for this partition
+                // started a log for that partition and does not have a high watermark value for this partition
               }
           }
           replicaState.put(partitionAndReplica, OnlineReplica)
-        case OfflineReplica =>
+        }
+        case OfflineReplica => {
           assertValidPreviousStates(partitionAndReplica,
             List(NewReplica, OnlineReplica, OfflineReplica, ReplicaDeletionIneligible), targetState)
           // send stop replica command to the replica so that it stops fetching from the leader
@@ -256,8 +265,6 @@ class ReplicaStateMachine(controller: KafkaController) extends Logging {
                         topic, partition, updatedLeaderIsrAndControllerEpoch, replicaAssignment)
                     }
                     replicaState.put(partitionAndReplica, OfflineReplica)
-                    stateChangeLogger.trace("Controller %d epoch %d changed state of replica %d for partition %s from %s to %s"
-                      .format(controllerId, controller.epoch, replicaId, topicAndPartition, currState, targetState))
                     false
                   case None =>
                     true
@@ -268,7 +275,8 @@ class ReplicaStateMachine(controller: KafkaController) extends Logging {
           if (leaderAndIsrIsEmpty)
             throw new StateChangeFailedException(
               "Failed to change state of replica %d for partition %s since the leader and isr path in zookeeper is empty"
-              .format(replicaId, topicAndPartition))
+                .format(replicaId, topicAndPartition))
+        }
       }
     }
     catch {
@@ -324,19 +332,19 @@ class ReplicaStateMachine(controller: KafkaController) extends Logging {
    * Invoked on startup of the replica's state machine to set the initial state for replicas of all existing partitions
    * in zookeeper
    */
-  private def initializeReplicaState() {
+  private def initializeReplicaState(): Unit = {
+    // <TopicAndPartition> -> Seq[Int]，保存了 <TopicAndPartition> 对应的所有AR
     for((topicPartition, assignedReplicas) <- controllerContext.partitionReplicaAssignment) {
       val topic = topicPartition.topic
       val partition = topicPartition.partition
+      // replicaId 是某个 <TopicAndPartition> 的 replica 的 id
       assignedReplicas.foreach { replicaId =>
         val partitionAndReplica = PartitionAndReplica(topic, partition, replicaId)
-        controllerContext.liveBrokerIds.contains(replicaId) match {
-          case true => replicaState.put(partitionAndReplica, OnlineReplica)
-          case false =>
-            // mark replicas on dead brokers as failed for topic deletion, if they belong to a topic to be deleted.
-            // This is required during controller failover since during controller failover a broker can go down,
-            // so the replicas on that broker should be moved to ReplicaDeletionIneligible to be on the safer side.
-            replicaState.put(partitionAndReplica, ReplicaDeletionIneligible)
+        // 如果某一个 PartitionAndReplica 所在的 broker 是存活的则初始化为 OnlineReplica，否则初始化为 ReplicaDeletionIneligible
+        if (controllerContext.liveBrokerIds.contains(replicaId)) {
+          replicaState.put(partitionAndReplica, OnlineReplica)
+        } else {
+          replicaState.put(partitionAndReplica, ReplicaDeletionIneligible)
         }
       }
     }

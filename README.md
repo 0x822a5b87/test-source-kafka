@@ -580,7 +580,18 @@
   }
 ```
 
+### ControllerContext 内部对象的作用
 
+> ControllerContext 内部包含了大量的对象：
+>
+> - `partitionReplicaAssignment` : **<TopicAndPartition> -> Seq[Int]**，包含了 <TopicAndPartition>  所包含的 AR。
+> - `partitionLeadershipInfo`
+> - `partitionsBeingReassigned`
+> - `partitionsUndergoingPreferredReplicaElection`
+> - `liveBrokersUnderlying`
+> - `liveBrokerIdsUnderlying`
+
+### ControllerBrokerRequestBatch 的作用是什么？它的 `newBatch` 方法中在不同情况下抛出的异常有什么用？
 
 
 

@@ -60,6 +60,7 @@ object ReplicationUtils extends Logging {
   }
 
   def getLeaderIsrAndEpochForPartition(zkClient: ZkClient, topic: String, partition: Int):Option[LeaderIsrAndControllerEpoch] = {
+    // brokers/topics/[topic]/partitions/[partition]/state
     val leaderAndIsrPath = ZkUtils.getTopicPartitionLeaderAndIsrPath(topic, partition)
     val leaderAndIsrInfo = ZkUtils.readDataMaybeNull(zkClient, leaderAndIsrPath)
     val leaderAndIsrOpt = leaderAndIsrInfo._1
