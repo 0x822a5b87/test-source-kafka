@@ -768,9 +768,9 @@ class KafkaController(val config : KafkaConfig, zkClient: ZkClient, val brokerSt
     val reassignedPartitions = partitionsBeingReassigned.filter { partition =>
       val replicasOpt = controllerContext.partitionReplicaAssignment.get(partition._1)
       val topicDeleted = replicasOpt.isEmpty
-      val successful = if(!topicDeleted) replicasOpt.get == partition._2.newReplicas else false
+      val successful = if (!topicDeleted) replicasOpt.get == partition._2.newReplicas else false
       topicDeleted || successful
-    }.map(_._1)
+    }.keys
     reassignedPartitions.foreach(p => removePartitionFromReassignedPartitions(p))
     var partitionsToReassign: mutable.Map[TopicAndPartition, ReassignedPartitionsContext] = new mutable.HashMap
     partitionsToReassign ++= partitionsBeingReassigned
