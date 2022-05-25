@@ -80,7 +80,7 @@ class ReplicaStateMachine(controller: KafkaController) extends Logging {
   }
 
   // de-register ZK listeners of the replica state machine
-  def deregisterListeners() {
+  def deregisterListeners(): Unit = {
     // de-register broker change listener
     deregisterBrokerChangeListener()
   }
@@ -226,36 +226,48 @@ class ReplicaStateMachine(controller: KafkaController) extends Logging {
             .format(controllerId, controller.epoch, replicaId, topicAndPartition, currState, targetState))
         }
         case OnlineReplica => {
+          // 检验 PrevStatus
           assertValidPreviousStates(partitionAndReplica,
             List(NewReplica, OnlineReplica, OfflineReplica, ReplicaDeletionIneligible), targetState)
           replicaState(partitionAndReplica) match {
             case NewReplica =>
-              // add this replica to the assigned replicas list for its partition
+              // 从 NewReplica -> OnlineReplica 只需要将replicaId添加到ControllerContext即可
+              // <TopicAndPartition> -> Seq[Int] -> replicaId
               val currentAssignedReplicas = controllerContext.partitionReplicaAssignment(topicAndPartition)
               if (!currentAssignedReplicas.contains(replicaId))
                 controllerContext.partitionReplicaAssignment.put(topicAndPartition, currentAssignedReplicas :+ replicaId)
             case _ =>
-              // check if the leader for this partition ever existed
+              // OnlineReplica, OfflineReplica, ReplicaDeletionIneligible -> OnlineReplica
               controllerContext.partitionLeadershipInfo.get(topicAndPartition) match {
                 case Some(leaderIsrAndControllerEpoch) =>
+                  // 如果leader存在，向replicaId对应的broker发送LeaderAndIsrRequest
                   brokerRequestBatch.addLeaderAndIsrRequestForBrokers(List(replicaId), topic, partition, leaderIsrAndControllerEpoch,
                     replicaAssignment)
+                  // 修改replica状态
                   replicaState.put(partitionAndReplica, OnlineReplica)
-                case None => // that means the partition was never in OnlinePartition state, this means the broker never
-                // started a log for that partition and does not have a high watermark value for this partition
+                case None =>
+                // 如果没有leader，说明partition从来没有进入过OnlinePartition，
+                // 也意味着broker从来没有为partition启动一个log，也没有拥有过HighWatermark
               }
           }
           replicaState.put(partitionAndReplica, OnlineReplica)
         }
         case OfflineReplica => {
+          // 检验PrevState
           assertValidPreviousStates(partitionAndReplica,
             List(NewReplica, OnlineReplica, OfflineReplica, ReplicaDeletionIneligible), targetState)
-          // send stop replica command to the replica so that it stops fetching from the leader
+          // 向replicaId对应的broker发送StopReplicaRequest以便于停止replica向leader fetch数据
           brokerRequestBatch.addStopReplicaRequestForBrokers(List(replicaId), topic, partition, deletePartition = false)
-          // As an optimization, the controller removes dead replicas from the ISR
+          // 作为一个优化，controller从ISR中删除了死亡的replicas
+          // 1. 不存在leader，则 leaderAndIsrIsEmpty = true
+          // 2. 存在leader，但是replica是leader，或者说删除了leader之后没有足够的ISR，则 leaderAndIsrIsEmpty = true
           val leaderAndIsrIsEmpty: Boolean =
             controllerContext.partitionLeadershipInfo.get(topicAndPartition) match {
-              case Some(currLeaderIsrAndControllerEpoch) =>
+              // 如果replica存在leader
+              case Some(_) => {
+                // Removes a given partition replica from the ISR;
+                // if it is not the current leader and there are sufficient remaining replicas in ISR.
+                // 将当前replica从ISR中删除
                 controller.removeReplicaFromIsr(topic, partition, replicaId) match {
                   case Some(updatedLeaderIsrAndControllerEpoch) =>
                     // send the shrunk ISR state change request to all the remaining alive replicas of the partition.
@@ -269,6 +281,7 @@ class ReplicaStateMachine(controller: KafkaController) extends Logging {
                   case None =>
                     true
                 }
+              }
               case None =>
                 true
             }
@@ -313,7 +326,7 @@ class ReplicaStateMachine(controller: KafkaController) extends Logging {
   }
 
   private def assertValidPreviousStates(partitionAndReplica: PartitionAndReplica, fromStates: Seq[ReplicaState],
-                                        targetState: ReplicaState) {
+                                        targetState: ReplicaState): Unit = {
     assert(fromStates.contains(replicaState(partitionAndReplica)),
       "Replica %s should be in the %s states before moving to %s state"
         .format(partitionAndReplica, fromStates.mkString(","), targetState) +

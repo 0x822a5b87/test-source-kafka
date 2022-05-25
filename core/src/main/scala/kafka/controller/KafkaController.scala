@@ -51,7 +51,10 @@ class ControllerContext(val zkClient: ZkClient,
   var epochZkVersion: Int = KafkaController.InitialControllerEpochZkVersion - 1
   val correlationId: AtomicInteger = new AtomicInteger(0)
   var allTopics: Set[String] = Set.empty
+  // <TopicAndPartition> -> Seq[Int] -> replicaId
+  // 保存了 <TopicAndPartition> 对应的所有AR的replicaId
   var partitionReplicaAssignment: mutable.Map[TopicAndPartition, Seq[Int]] = mutable.Map.empty
+  // 保存了 <TopicAndPartition> 对应的所有 leader、ISR、controllerEpoch
   var partitionLeadershipInfo: mutable.Map[TopicAndPartition, LeaderIsrAndControllerEpoch] = mutable.Map.empty
   var partitionsBeingReassigned: mutable.Map[TopicAndPartition, ReassignedPartitionsContext] = new mutable.HashMap
   var partitionsUndergoingPreferredReplicaElection: mutable.Set[TopicAndPartition] = new mutable.HashSet
