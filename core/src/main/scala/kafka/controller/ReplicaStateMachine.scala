@@ -173,7 +173,7 @@ class ReplicaStateMachine(controller: KafkaController) extends Logging {
       targetState match {
         case NewReplica => {
           assertValidPreviousStates(partitionAndReplica, List(NonExistentReplica), targetState)
-          // 启动replica作为它分区的当前leader的follower
+          // 从 /brokers/topics/[topic]/partitions/[partition]/state 读取 replica 的 leader、ISR 等状态
           val leaderIsrAndControllerEpochOpt = ReplicationUtils.getLeaderIsrAndEpochForPartition(zkClient, topic, partition)
           leaderIsrAndControllerEpochOpt match {
             // 由于是从 NonExistentReplica 变为 NewReplica，所以此时应该没有 leader
@@ -372,25 +372,34 @@ class ReplicaStateMachine(controller: KafkaController) extends Logging {
    */
   class BrokerChangeListener() extends IZkChildListener with Logging {
     this.logIdent = "[BrokerChangeListener on Controller " + controller.config.brokerId + "]: "
-    def handleChildChange(parentPath : String, currentBrokerList : java.util.List[String]) {
+    def handleChildChange(parentPath : String, currentBrokerList : java.util.List[String]): Unit = {
       info("Broker change listener fired for path %s with children %s".format(parentPath, currentBrokerList.mkString(",")))
       inLock(controllerContext.controllerLock) {
         if (hasStarted.get) {
           ControllerStats.leaderElectionTimer.time {
             try {
+              // 当前存活的brokerId，这个是注册在zk上的数据
               val curBrokerIds = currentBrokerList.map(_.toInt).toSet
+              // 获取新添加的brokerId
               val newBrokerIds = curBrokerIds -- controllerContext.liveOrShuttingDownBrokerIds
-              val newBrokerInfo = newBrokerIds.map(ZkUtils.getBrokerInfo(zkClient, _))
-              val newBrokers = newBrokerInfo.filter(_.isDefined).map(_.get)
+              // 获取 /brokers/ids/[id] 对应的 broker 信息，包括 host, port 等
+              val newBrokers = newBrokerIds.map(ZkUtils.getBrokerInfo(zkClient, _)).filter(_.isDefined).map(_.get)
+              // 获取已经下线的brokerId
               val deadBrokerIds = controllerContext.liveOrShuttingDownBrokerIds -- curBrokerIds
+              // 修改ControllerContext缓存
               controllerContext.liveBrokers = curBrokerIds.map(ZkUtils.getBrokerInfo(zkClient, _)).filter(_.isDefined).map(_.get)
               info("Newly added brokers: %s, deleted brokers: %s, all live brokers: %s"
                 .format(newBrokerIds.mkString(","), deadBrokerIds.mkString(","), controllerContext.liveBrokerIds.mkString(",")))
+              // 添加broker并启动broker后台服务线程
               newBrokers.foreach(controllerContext.controllerChannelManager.addBroker(_))
+              // 删除下线broker
               deadBrokerIds.foreach(controllerContext.controllerChannelManager.removeBroker(_))
-              if(newBrokerIds.size > 0)
+              if(newBrokerIds.nonEmpty) {
+                // 将新的broker上的replica和partition设置为OnlineReplica和OnlinePartition
                 controller.onBrokerStartup(newBrokerIds.toSeq)
-              if(deadBrokerIds.size > 0)
+              }
+              if(deadBrokerIds.nonEmpty)
+              // 将新的broker上的replica和partition设置为OfflineReplica和OfflinePartition
                 controller.onBrokerFailure(deadBrokerIds.toSeq)
             } catch {
               case e: Throwable => error("Error while handling broker changes", e)

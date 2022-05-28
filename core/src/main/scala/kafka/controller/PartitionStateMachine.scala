@@ -16,18 +16,17 @@
 */
 package kafka.controller
 
-import collection._
-import collection.JavaConversions
-import collection.mutable.Buffer
-import java.util.concurrent.atomic.AtomicBoolean
 import kafka.api.LeaderAndIsr
-import kafka.common.{LeaderElectionNotNeededException, TopicAndPartition, StateChangeFailedException, NoReplicaOnlineException}
-import kafka.utils.{Logging, ZkUtils, ReplicationUtils}
-import org.I0Itec.zkclient.{IZkDataListener, IZkChildListener}
-import org.I0Itec.zkclient.exception.ZkNodeExistsException
-import org.apache.log4j.Logger
+import kafka.common.{LeaderElectionNotNeededException, NoReplicaOnlineException, StateChangeFailedException, TopicAndPartition}
 import kafka.controller.Callbacks.CallbackBuilder
 import kafka.utils.Utils._
+import kafka.utils.{Logging, ReplicationUtils, ZkUtils}
+import org.I0Itec.zkclient.exception.ZkNodeExistsException
+import org.I0Itec.zkclient.{IZkChildListener, IZkDataListener, ZkClient}
+
+import java.util.concurrent.atomic.AtomicBoolean
+import scala.collection.mutable.Buffer
+import scala.collection.{JavaConversions, mutable, _}
 
 /**
  * This class represents the state machine for partitions. It defines the states that a partition can be in, and
@@ -414,7 +413,7 @@ class PartitionStateMachine(controller: KafkaController) extends Logging {
     zkClient.unsubscribeChildChanges(ZkUtils.BrokerTopicsPath, topicChangeListener)
   }
 
-  def registerPartitionChangeListener(topic: String) = {
+  def registerPartitionChangeListener(topic: String): Unit = {
     addPartitionsListener.put(topic, new AddPartitionsListener(topic))
     zkClient.subscribeDataChanges(ZkUtils.getTopicPath(topic), addPartitionsListener(topic))
   }
@@ -467,6 +466,10 @@ class PartitionStateMachine(controller: KafkaController) extends Logging {
             // 修改当前的所有topics
             controllerContext.allTopics = currentChildren
 
+            // 从 /brokers/topics/[topic] 下读取读取partition的replica分配信息，例如：
+            // get /brokers/topics/test
+            // {"version":1,"partitions":{"0":[0,1,2]}}
+            // 那此时我们就得到了 {test, 0} -> [0, 1, 2]
             val addedPartitionReplicaAssignment = ZkUtils.getReplicaAssignmentForTopics(zkClient, newTopics.toSeq)
             // 在RA中删除deletedTopics
             controllerContext.partitionReplicaAssignment = controllerContext.partitionReplicaAssignment.filter(p =>
@@ -477,7 +480,7 @@ class PartitionStateMachine(controller: KafkaController) extends Logging {
               deletedTopics, addedPartitionReplicaAssignment))
             if(newTopics.nonEmpty) {
               // 创建新的topic
-              controller.onNewTopicCreation(newTopics, addedPartitionReplicaAssignment.keySet.toSet)
+              controller.onNewTopicCreation(newTopics, addedPartitionReplicaAssignment.keySet)
             }
           } catch {
             case e: Throwable => error("Error while handling new topic", e )
@@ -494,29 +497,32 @@ class PartitionStateMachine(controller: KafkaController) extends Logging {
    */
   class DeleteTopicsListener() extends IZkChildListener with Logging {
     this.logIdent = "[DeleteTopicsListener on " + controller.config.brokerId + "]: "
-    val zkClient = controllerContext.zkClient
+    val zkClient: ZkClient = controllerContext.zkClient
 
     /**
      * Invoked when a topic is being deleted
      * @throws Exception On any error.
      */
     @throws(classOf[Exception])
-    def handleChildChange(parentPath : String, children : java.util.List[String]) {
+    def handleChildChange(parentPath : String, children : java.util.List[String]): Unit = {
       inLock(controllerContext.controllerLock) {
         var topicsToBeDeleted = {
           import JavaConversions._
-          (children: Buffer[String]).toSet
+          (children: mutable.Buffer[String]).toSet
         }
         debug("Delete topics listener fired for topics %s to be deleted".format(topicsToBeDeleted.mkString(",")))
-        val nonExistentTopics = topicsToBeDeleted.filter(t => !controllerContext.allTopics.contains(t))
-        if(nonExistentTopics.size > 0) {
+        // 找出不存在的topic
+        val nonExistentTopics = topicsToBeDeleted.diff(controllerContext.allTopics)
+        if(nonExistentTopics.nonEmpty) {
           warn("Ignoring request to delete non-existing topics " + nonExistentTopics.mkString(","))
+          // 删除zk上不存在的topic对应的path
           nonExistentTopics.foreach(topic => ZkUtils.deletePathRecursive(zkClient, ZkUtils.getDeleteTopicPath(topic)))
         }
+        // 找出等待删除的topic
         topicsToBeDeleted --= nonExistentTopics
-        if(topicsToBeDeleted.size > 0) {
+        if(topicsToBeDeleted.nonEmpty) {
           info("Starting topic deletion for topics " + topicsToBeDeleted.mkString(","))
-          // mark topic ineligible for deletion if other state changes are in progress
+          // 如果topic处于preferred replica选举、reassigned 流程，则标记为暂时不可删除
           topicsToBeDeleted.foreach { topic =>
             val preferredReplicaElectionInProgress =
               controllerContext.partitionsUndergoingPreferredReplicaElection.map(_.topic).contains(topic)
@@ -525,7 +531,7 @@ class PartitionStateMachine(controller: KafkaController) extends Logging {
             if(preferredReplicaElectionInProgress || partitionReassignmentInProgress)
               controller.deleteTopicManager.markTopicIneligibleForDeletion(Set(topic))
           }
-          // add topic to deletion list
+          // 删除topic
           controller.deleteTopicManager.enqueueTopicsForDeletion(topicsToBeDeleted)
         }
       }
@@ -537,7 +543,7 @@ class PartitionStateMachine(controller: KafkaController) extends Logging {
    *             On any error.
      */
     @throws(classOf[Exception])
-    def handleDataDeleted(dataPath: String) {
+    def handleDataDeleted(dataPath: String): Unit = {
     }
   }
 

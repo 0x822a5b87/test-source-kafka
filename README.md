@@ -593,7 +593,56 @@
 
 ### ControllerBrokerRequestBatch 的作用是什么？它的 `newBatch` 方法中在不同情况下抛出的异常有什么用？
 
+### ControllerContext#liveBrokersUnderlying 表示的是什么？它在什么时候会变更呢？
 
+> `ControllerContext` 内部包含了很多broker相关的数据，主要包括：
+>
+> ```scala
+> class ControllerContext(val zkClient: ZkClient,
+>                         val zkSessionTimeout: Int) {
+>     // 已经shutdown的broker的id集合
+>   var shuttingDownBrokerIds: mutable.Set[Int] = mutable.Set.empty
+>   // 所有可能处于在线状态的broker列表
+>   private var liveBrokersUnderlying: Set[Broker] = Set.empty
+>   // 所有可能在线状态的broker对应的id列表
+>   private var liveBrokerIdsUnderlying: Set[Int] = Set.empty
+> }
+> ```
+>
+> 除此之外，还提供了很多的函数通过以上三个Set来获取相应的信息，为了便于理解，我把他们修改成了函数的形式：
+>
+> ```scala
+>   // setter
+>   def liveBrokers_=(brokers: Set[Broker]): Unit = {
+>     liveBrokersUnderlying = brokers
+>     liveBrokerIdsUnderlying = liveBrokersUnderlying.map(_.id)
+>   }
+> 
+>   // getter
+>   def liveBrokers: Set[Broker] = {
+>     return liveBrokersUnderlying.filter(broker => !shuttingDownBrokerIds.contains(broker.id))
+>   }
+>   def liveBrokerIds: Set[Int] = {
+>     return liveBrokerIdsUnderlying.filter(brokerId => !shuttingDownBrokerIds.contains(brokerId))
+>   }
+> 
+>   def liveOrShuttingDownBrokerIds: Set[Int] = {
+>     return liveBrokerIdsUnderlying
+>   }
+>   def liveOrShuttingDownBrokers: Set[Broker] = {
+>     return liveBrokersUnderlying
+>   }
+> ```
+>
+> 而为什么是 `underlying` 的呢，首先看看 `setter` 的调用：
+>
+> - `KafkaController#onControllerFailover` -> `KafkaController#initializeControllerContext`  在 controller 当选时初始化
+> - `ReplicaStateMachine#BrokerChangeListener` 在 `/broers/ids` 变更时修改
+>
+> 而 `shuttingDownBrokerIds` ：
+>
+> - `KafkaController#onBrokerFailure` -> `controllerContext.shuttingDownBrokerIds.remove(id)`
+> - `KafkaController#shutdownBroker` -> `controllerContext.shuttingDownBrokerIds.add(id)`
 
 
 

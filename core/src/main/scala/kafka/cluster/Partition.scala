@@ -232,11 +232,12 @@ class Partition(val topic: String,
     }
   }
 
-  def updateLeaderHWAndMaybeExpandIsr(replicaId: Int) {
+  def updateLeaderHWAndMaybeExpandIsr(replicaId: Int): Unit = {
     inWriteLock(leaderIsrUpdateLock) {
-      // check if this replica needs to be added to the ISR
       leaderReplicaIfLocal() match {
         case Some(leaderReplica) =>
+          // 只有leader才能执行更新HW，expand ISR的操作
+          // 注意，这里replicaId是请求的参数，而这个请求会在所有的broker上执行，但是只有replica leader所在的broker才会执行到这一步
           val replica = getReplica(replicaId).get
           val leaderHW = leaderReplica.highWatermark
           // For a replica to get added back to ISR, it has to satisfy 3 conditions-
@@ -244,13 +245,13 @@ class Partition(val topic: String,
           // 2. It is part of the assigned replica list. See KAFKA-1097
           // 3. It's log end offset >= leader's high watermark
           if (!inSyncReplicas.contains(replica) &&
-            assignedReplicas.map(_.brokerId).contains(replicaId) &&
+            assignedReplicas().map(_.brokerId).contains(replicaId) &&
             replica.logEndOffset.offsetDiff(leaderHW) >= 0) {
             // expand ISR
             val newInSyncReplicas = inSyncReplicas + replica
             info("Expanding ISR for partition [%s,%d] from %s to %s"
                  .format(topic, partitionId, inSyncReplicas.map(_.brokerId).mkString(","), newInSyncReplicas.map(_.brokerId).mkString(",")))
-            // update ISR in ZK and cache
+            // 更新 /brokers/topics/[topic]/partitions/[partition]/state 节点，将replicaId重新添加到ISR
             updateIsr(newInSyncReplicas)
             replicaManager.isrExpandRate.mark()
           }
