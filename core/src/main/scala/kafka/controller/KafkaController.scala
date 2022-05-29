@@ -1171,48 +1171,58 @@ class KafkaController(val config : KafkaConfig, zkClient: ZkClient, val brokerSt
   private def checkAndTriggerPartitionRebalance(): Unit = {
     if (isActive()) {
       trace("checking need to trigger partition rebalance")
-      // get all the active brokers
       var preferredReplicasForTopicsByBrokers: Map[Int, Map[TopicAndPartition, Seq[Int]]] = null
       inLock(controllerContext.controllerLock) {
+        // 获取没有删除的AR对应的preferred replica
+        // replicaId -> Map[<TopicAndPartition>, replicaIds]
+        // 其中replicaId是preferred replica，同时replicaId也对应brokerId
         preferredReplicasForTopicsByBrokers =
           controllerContext.partitionReplicaAssignment.filterNot(p => deleteTopicManager.isTopicQueuedUpForDeletion(p._1.topic)).groupBy {
             case(topicAndPartition, assignedReplicas) => assignedReplicas.head
           }
       }
       debug("preferred replicas by broker " + preferredReplicasForTopicsByBrokers)
-      // for each broker, check if a preferred replica election needs to be triggered
+      // 对于每一个broker，检查是否需要replica重新选举
       preferredReplicasForTopicsByBrokers.foreach {
-        case(leaderBroker, topicAndPartitionsForBroker) => {
+        case(headReplicaId, topicAndPartitionsForBroker) => {
           var imbalanceRatio: Double = 0
           var topicsNotInPreferredReplica: Map[TopicAndPartition, Seq[Int]] = null
           inLock(controllerContext.controllerLock) {
+            // 找到leader replica不是preferred replica的 <TopicAndPartition>
+            // <TopicAndPartition> -> replicaIds
             topicsNotInPreferredReplica =
               topicAndPartitionsForBroker.filter {
                 case(topicPartition, replicas) => {
                   controllerContext.partitionLeadershipInfo.contains(topicPartition) &&
-                  controllerContext.partitionLeadershipInfo(topicPartition).leaderAndIsr.leader != leaderBroker
+                  controllerContext.partitionLeadershipInfo(topicPartition).leaderAndIsr.leader != headReplicaId
                 }
               }
             debug("topics not in preferred replica " + topicsNotInPreferredReplica)
+            // <TopicAndPartition>在broker上的replica数量
             val totalTopicPartitionsForBroker = topicAndPartitionsForBroker.size
+            // <TopicAndPartition>在broker上leader replica非preferred replica的数量
             val totalTopicPartitionsNotLedByBroker = topicsNotInPreferredReplica.size
+            // 计算上面两个数值的比例
             imbalanceRatio = totalTopicPartitionsNotLedByBroker.toDouble / totalTopicPartitionsForBroker
-            trace("leader imbalance ratio for broker %d is %f".format(leaderBroker, imbalanceRatio))
+            trace("leader imbalance ratio for broker %d is %f".format(headReplicaId, imbalanceRatio))
           }
-          // check ratio and if greater than desired ratio, trigger a rebalance for the topic partitions
-          // that need to be on this broker
+          // 如果leader replica非preferred replica超过一定的比例，那么针对该<TopicAndPartition>执行一次rebalance
           if (imbalanceRatio > (config.leaderImbalancePerBrokerPercentage.toDouble / 100)) {
             topicsNotInPreferredReplica.foreach {
               case(topicPartition, replicas) => {
                 inLock(controllerContext.controllerLock) {
-                  // do this check only if the broker is live and there are no partitions being reassigned currently
-                  // and preferred replica election is not in progress
-                  if (controllerContext.liveBrokerIds.contains(leaderBroker) &&
-                      controllerContext.partitionsBeingReassigned.size == 0 &&
-                      controllerContext.partitionsUndergoingPreferredReplicaElection.size == 0 &&
+                  // 如果该<TopicAndPartition>满足以下条件，则触发一次重新选举
+                  // 1. preferred replica对应的broker存活
+                  // 2. 没有partition正在进行reassigned
+                  // 3. 没有partition正在进行preferred replica选举
+                  // 4. topic 没有被删除
+                  // 5. 当前ControllerContext中包含了该topic
+                  if (controllerContext.liveBrokerIds.contains(headReplicaId) &&
+                      controllerContext.partitionsBeingReassigned.isEmpty &&
+                      controllerContext.partitionsUndergoingPreferredReplicaElection.isEmpty &&
                       !deleteTopicManager.isTopicQueuedUpForDeletion(topicPartition.topic) &&
                       controllerContext.allTopics.contains(topicPartition.topic)) {
-                    onPreferredReplicaElection(Set(topicPartition), true)
+                    onPreferredReplicaElection(Set(topicPartition), isTriggeredByAutoRebalance = true)
                   }
                 }
               }
