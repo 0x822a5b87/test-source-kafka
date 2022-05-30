@@ -644,6 +644,8 @@
 > - `KafkaController#onBrokerFailure` -> `controllerContext.shuttingDownBrokerIds.remove(id)`
 > - `KafkaController#shutdownBroker` -> `controllerContext.shuttingDownBrokerIds.add(id)`
 
+### ReplicaDeletionineligible 状态如何变幻为其他的状态？
+
 
 
 

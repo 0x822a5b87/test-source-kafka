@@ -17,11 +17,14 @@
 package kafka.controller
 
 import collection.mutable
-import kafka.utils.{ShutdownableThread, Logging, ZkUtils}
+import kafka.utils.{Logging, ShutdownableThread, ZkUtils}
 import kafka.utils.Utils._
+
 import collection.Set
 import kafka.common.{ErrorMapping, TopicAndPartition}
-import kafka.api.{StopReplicaResponse, RequestOrResponse}
+import kafka.api.{RequestOrResponse, StopReplicaResponse}
+import org.I0Itec.zkclient.ZkClient
+
 import java.util.concurrent.locks.ReentrantLock
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -89,7 +92,7 @@ class TopicDeletionManager(controller: KafkaController,
   def start() {
     if (isDeleteTopicEnabled) {
       deleteTopicsThread = new DeleteTopicsThread()
-      if (topicsToBeDeleted.size > 0)
+      if (topicsToBeDeleted.nonEmpty)
         deleteTopicStateChanged.set(true)
       deleteTopicsThread.start()
     }
@@ -270,22 +273,27 @@ class TopicDeletionManager(controller: KafkaController,
     controller.replicaStateMachine.handleStateChanges(failedReplicas, OfflineReplica)
   }
 
-  private def completeDeleteTopic(topic: String) {
-    // deregister partition change listener on the deleted topic. This is to prevent the partition change listener
-    // firing before the new topic listener when a deleted topic gets auto created
+  private def completeDeleteTopic(topic: String): Unit = {
+    // 取消topic的/brokers/topics/[topic]目录监听器
     partitionStateMachine.deregisterPartitionChangeListener(topic)
     val replicasForDeletedTopic = controller.replicaStateMachine.replicasInState(topic, ReplicaDeletionSuccessful)
     // controller will remove this replica from the state machine as well as its partition assignment cache
+    // replica状态从ReplicaDeletionSuccessful->NonExistentReplica
+    // 状态机会删除这些replica对应的AR信息和replicaState信息
     replicaStateMachine.handleStateChanges(replicasForDeletedTopic, NonExistentReplica)
     val partitionsForDeletedTopic = controllerContext.partitionsForTopic(topic)
-    // move respective partition to OfflinePartition and NonExistentPartition state
+    // 将相关的partition设只为OfflinePartition和NonExistentPartition
     partitionStateMachine.handleStateChanges(partitionsForDeletedTopic, OfflinePartition)
     partitionStateMachine.handleStateChanges(partitionsForDeletedTopic, NonExistentPartition)
     topicsToBeDeleted -= topic
     partitionsToBeDeleted.retain(_.topic != topic)
+
+    // 删除zookeeper上topic相关的节点
     controllerContext.zkClient.deleteRecursive(ZkUtils.getTopicPath(topic))
     controllerContext.zkClient.deleteRecursive(ZkUtils.getTopicConfigPath(topic))
     controllerContext.zkClient.delete(ZkUtils.getDeleteTopicPath(topic))
+
+    // 删除topic相关的缓存
     controllerContext.removeTopic(topic)
   }
 
@@ -296,14 +304,16 @@ class TopicDeletionManager(controller: KafkaController,
    * {@link LeaderAndIsr#LeaderDuringDelete}. This lets each broker know that this topic is being deleted and can be
    * removed from their caches.
    */
-  private def onTopicDeletion(topics: Set[String]) {
+  private def onTopicDeletion(topics: Set[String]): Unit = {
     info("Topic deletion callback for %s".format(topics.mkString(",")))
-    // send update metadata so that brokers stop serving data for topics to be deleted
+    // 发送UpdateMetadataRequest到broker让broker提供数据服务以便于删除
     val partitions = topics.flatMap(controllerContext.partitionsForTopic)
     controller.sendUpdateMetadataRequest(controllerContext.liveOrShuttingDownBrokerIds.toSeq, partitions)
+    // topic -> Map<[TopicAndPartition], replicaIds>
     val partitionReplicaAssignmentByTopic = controllerContext.partitionReplicaAssignment.groupBy(p => p._1.topic)
+    // 对topics列表里的所有topic执行分区删除操作
     topics.foreach { topic =>
-      onPartitionDeletion(partitionReplicaAssignmentByTopic(topic).map(_._1).toSet)
+      onPartitionDeletion(partitionReplicaAssignmentByTopic(topic).keySet)
     }
   }
 
@@ -321,23 +331,29 @@ class TopicDeletionManager(controller: KafkaController,
    * 1. Move all dead replicas directly to ReplicaDeletionIneligible state. Also mark the respective topics ineligible
    *    for deletion if some replicas are dead since it won't complete successfully anyway
    * 2. Move all alive replicas to ReplicaDeletionStarted state so they can be deleted successfully
-   *@param replicasForTopicsToBeDeleted
+   *@param replicasForTopicsToBeDeleted 等待删除的replica
    */
-  private def startReplicaDeletion(replicasForTopicsToBeDeleted: Set[PartitionAndReplica]) {
+  private def startReplicaDeletion(replicasForTopicsToBeDeleted: Set[PartitionAndReplica]): Unit = {
     replicasForTopicsToBeDeleted.groupBy(_.topic).foreach { case(topic, replicas) =>
-      var aliveReplicasForTopic = controllerContext.allLiveReplicas().filter(p => p.topic.equals(topic))
+      // 获取topic对应的alive replicas
+      val aliveReplicasForTopic = controllerContext.allLiveReplicas().filter(p => p.topic.equals(topic))
+      // 获取topic对应的dead replicas
       val deadReplicasForTopic = replicasForTopicsToBeDeleted -- aliveReplicasForTopic
+      // 获取topic对应的删除成功的replicas
       val successfullyDeletedReplicas = controller.replicaStateMachine.replicasInState(topic, ReplicaDeletionSuccessful)
+      // 获取topic对应的需要重试的replicas
       val replicasForDeletionRetry = aliveReplicasForTopic -- successfullyDeletedReplicas
-      // move dead replicas directly to failed state
+      // 直接将dead replicas修改为ReplicaDeletionIneligible
       replicaStateMachine.handleStateChanges(deadReplicasForTopic, ReplicaDeletionIneligible)
-      // send stop replica to all followers that are not in the OfflineReplica state so they stop sending fetch requests to the leader
+      // 向所有未处于 OfflineReplica 状态的追随者发送停止副本，以便他们停止向领导者发送获取请求
       replicaStateMachine.handleStateChanges(replicasForDeletionRetry, OfflineReplica)
       debug("Deletion started for replicas %s".format(replicasForDeletionRetry.mkString(",")))
+      // 使用deleteTopicStopReplicaCallback作为callback，重试删除
       controller.replicaStateMachine.handleStateChanges(replicasForDeletionRetry, ReplicaDeletionStarted,
         new Callbacks.CallbackBuilder().stopReplicaCallback(deleteTopicStopReplicaCallback).build)
-      if(deadReplicasForTopic.size > 0) {
+      if(deadReplicasForTopic.nonEmpty) {
         debug("Dead Replicas (%s) found for topic %s".format(deadReplicasForTopic.mkString(","), topic))
+        // 如果topic存在dead replica，标记topic删除失败
         markTopicIneligibleForDeletion(Set(topic))
       }
     }
@@ -354,19 +370,20 @@ class TopicDeletionManager(controller: KafkaController,
    * 3. Move all replicas to ReplicaDeletionStarted state. This will send StopReplicaRequest with deletePartition=true. And
    *    will delete all persistent data from all replicas of the respective partitions
    */
-  private def onPartitionDeletion(partitionsToBeDeleted: Set[TopicAndPartition]) {
+  private def onPartitionDeletion(partitionsToBeDeleted: Set[TopicAndPartition]): Unit = {
     info("Partition deletion callback for %s".format(partitionsToBeDeleted.mkString(",")))
+    // 获取等待删除的replica列表
     val replicasPerPartition = controllerContext.replicasForPartition(partitionsToBeDeleted)
     startReplicaDeletion(replicasPerPartition)
   }
 
-  private def deleteTopicStopReplicaCallback(stopReplicaResponseObj: RequestOrResponse, replicaId: Int) {
+  private def deleteTopicStopReplicaCallback(stopReplicaResponseObj: RequestOrResponse, replicaId: Int): Unit = {
     val stopReplicaResponse = stopReplicaResponseObj.asInstanceOf[StopReplicaResponse]
     debug("Delete topic callback invoked for %s".format(stopReplicaResponse))
     val partitionsInError = if(stopReplicaResponse.errorCode != ErrorMapping.NoError) {
       stopReplicaResponse.responseMap.keySet
     } else
-      stopReplicaResponse.responseMap.filter(p => p._2 != ErrorMapping.NoError).map(_._1).toSet
+      stopReplicaResponse.responseMap.filter(p => p._2 != ErrorMapping.NoError).keySet
     val replicasInError = partitionsInError.map(p => PartitionAndReplica(p.topic, p.partition, replicaId))
     inLock(controllerContext.controllerLock) {
       // move all the failed replicas to ReplicaDeletionIneligible
@@ -380,8 +397,9 @@ class TopicDeletionManager(controller: KafkaController,
   }
 
   class DeleteTopicsThread() extends ShutdownableThread(name = "delete-topics-thread-" + controller.config.brokerId, isInterruptible = false) {
-    val zkClient = controllerContext.zkClient
-    override def doWork() {
+    val zkClient: ZkClient = controllerContext.zkClient
+    override def doWork(): Unit = {
+      // 等待 deleteTopicsCond 条件
       awaitTopicDeletionNotification()
 
       if (!isRunning.get)
@@ -390,39 +408,42 @@ class TopicDeletionManager(controller: KafkaController,
       inLock(controllerContext.controllerLock) {
         val topicsQueuedForDeletion = Set.empty[String] ++ topicsToBeDeleted
 
-        if(!topicsQueuedForDeletion.isEmpty)
+        if(topicsQueuedForDeletion.nonEmpty)
           info("Handling deletion for topics " + topicsQueuedForDeletion.mkString(","))
 
         topicsQueuedForDeletion.foreach { topic =>
-        // if all replicas are marked as deleted successfully, then topic deletion is done
+          // 先检查topic的状态，看看是否已经删除完成，是否存在删除失败等情况
+          // 如果topic的所有的replicas都是ReplicaDeletionSuccessful状态，则删除topic
           if(controller.replicaStateMachine.areAllReplicasForTopicDeleted(topic)) {
-            // clear up all state for this topic from controller cache and zookeeper
+            // 删除controller和zookeeper中所有该topic的状态信息
             completeDeleteTopic(topic)
             info("Deletion of topic %s successfully completed".format(topic))
           } else {
+            // 如果topic至少有一个分区处于ReplicaDeletionStarted状态
             if(controller.replicaStateMachine.isAtLeastOneReplicaInDeletionStartedState(topic)) {
-              // ignore since topic deletion is in progress
+              // 这里其实什么都没有做，只是输出了一条日志
               val replicasInDeletionStartedState = controller.replicaStateMachine.replicasInState(topic, ReplicaDeletionStarted)
               val replicaIds = replicasInDeletionStartedState.map(_.replica)
               val partitions = replicasInDeletionStartedState.map(r => TopicAndPartition(r.topic, r.partition))
               info("Deletion for replicas %s for partition %s of topic %s in progress".format(replicaIds.mkString(","),
                 partitions.mkString(","), topic))
             } else {
-              // if you come here, then no replica is in TopicDeletionStarted and all replicas are not in
-              // TopicDeletionSuccessful. That means, that either given topic haven't initiated deletion
-              // or there is at least one failed replica (which means topic deletion should be retried).
+              // 如果到这里，说明没有replica处于TopicDeletionStarted，并且不是所有的replica都处于ReplicaDeletionSuccessful
+              // 意味着，要么给定的topic没有初始化deletion，或者最少有一个replica处于ReplicaDeletionIneligible：
               if(controller.replicaStateMachine.isAnyReplicaInState(topic, ReplicaDeletionIneligible)) {
-                // mark topic for deletion retry
+                // 通过将replica状态变更ReplicaDeletionIneligible->OfflineReplica来实现kafka分区删除重试
                 markTopicForDeletionRetry(topic)
               }
             }
           }
-          // Try delete topic if it is eligible for deletion.
+          // 真正的进入topic删除流程
+          // 如果topic符合删除条件
           if(isTopicEligibleForDeletion(topic)) {
             info("Deletion of topic %s (re)started".format(topic))
-            // topic deletion will be kicked off
+            // 开始删除topic
             onTopicDeletion(Set(topic))
           } else if(isTopicIneligibleForDeletion(topic)) {
+            // 针对无法删除的topic不做任何处理，只是简单的输出日志
             info("Not retrying deletion of topic %s at this time since it is marked ineligible for deletion".format(topic))
           }
         }
