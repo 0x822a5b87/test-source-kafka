@@ -115,21 +115,26 @@ class RequestSendThread(val controllerId: Int,
   extends ShutdownableThread("Controller-%d-to-broker-%d-send-thread".format(controllerId, toBroker.id)) {
   private val lock = new Object()
   private val stateChangeLogger = KafkaController.stateChangeLogger
+  // 初始化BlockingChannel到指定broker的连接
   connectToBroker(toBroker, channel)
 
   override def doWork(): Unit = {
     val queueItem = queue.take()
+    // 获取request
     val request = queueItem._1
+    // 获取callback
     val callback = queueItem._2
     var receive: Receive = null
     try {
       lock synchronized {
         var isSendSuccessful = false
+        // 重试机制
         while(isRunning.get() && !isSendSuccessful) {
-          // if a broker goes down for a long time, then at some point the controller's zookeeper listener will trigger a
-          // removeBroker which will invoke shutdown() on this thread. At that point, we will stop retrying.
+          // 如果broker长时间的不在线，在某个时间点controller会触发removeBroker断开本线程，此时停止重试
           try {
+            // 发送一个请求
             channel.send(request)
+            // 接收一个响应
             receive = channel.receive()
             isSendSuccessful = true
           } catch {
@@ -137,6 +142,7 @@ class RequestSendThread(val controllerId: Int,
               warn(("Controller %d epoch %d fails to send request %s to broker %s. " +
                 "Reconnecting to broker.").format(controllerId, controllerContext.epoch,
                 request.toString, toBroker.toString()), e)
+              // 如果失败了，我们需要重新连接
               channel.disconnect()
               connectToBroker(toBroker, channel)
               isSendSuccessful = false
@@ -144,6 +150,8 @@ class RequestSendThread(val controllerId: Int,
               Utils.swallow(Thread.sleep(300))
           }
         }
+
+        // 处理broker响应
         var response: RequestOrResponse = null
         request.requestId.get match {
           case RequestKeys.LeaderAndIsrKey =>
@@ -153,9 +161,8 @@ class RequestSendThread(val controllerId: Int,
           case RequestKeys.UpdateMetadataKey =>
             response = UpdateMetadataResponse.readFrom(receive.buffer)
         }
-        stateChangeLogger.trace("Controller %d epoch %d received response %s for a request sent to broker %s"
-                                  .format(controllerId, controllerContext.epoch, response.toString, toBroker.toString))
 
+        // 如果回调函数不为空，则对response进行回调
         if(callback != null) {
           callback(response)
         }
@@ -168,7 +175,7 @@ class RequestSendThread(val controllerId: Int,
     }
   }
 
-  private def connectToBroker(broker: Broker, channel: BlockingChannel) {
+  private def connectToBroker(broker: Broker, channel: BlockingChannel): Unit = {
     try {
       channel.connect()
       info("Controller %d connected to %s for sending state change requests".format(controllerId, broker.toString()))

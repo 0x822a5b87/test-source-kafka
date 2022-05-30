@@ -24,7 +24,7 @@ import kafka.api.RequestOrResponse
 
 
 object BlockingChannel{
-  val UseDefaultBufferSize = -1
+  val UseDefaultBufferSize: Int = -1
 }
 
 /**
@@ -37,16 +37,30 @@ class BlockingChannel( val host: String,
                        val readBufferSize: Int, 
                        val writeBufferSize: Int, 
                        val readTimeoutMs: Int ) extends Logging {
+  // 是否连接
   private var connected = false
-  private var channel: SocketChannel = null
-  private var readChannel: ReadableByteChannel = null
-  private var writeChannel: GatheringByteChannel = null
+  // socket 客户端
+  private var channel: SocketChannel = _
+  // 读通道
+  private var readChannel: ReadableByteChannel = _
+  // 写通道
+  private var writeChannel: GatheringByteChannel = _
   private val lock = new Object()
   private val connectTimeoutMs = readTimeoutMs
 
-  def connect() = lock synchronized  {
+  /**
+   * 连接到一台指定的broker的方法，会在以下几种情况下调用：
+   * 1. 客户端消费；
+   * 2. SimpleConsumer 消费；
+   * 3. SyncProducer 生产；
+   * 4. RequestSendThread 初始化；
+   * 5. RequestSendThread 工作时传输数据出现异常；
+   * 6. KafkaApis 触发 controlledShutdown。
+   */
+  def connect(): Unit = lock synchronized  {
     if(!connected) {
       try {
+        // 打开并配置socket连接
         channel = SocketChannel.open()
         if(readBufferSize > 0)
           channel.socket.setReceiveBufferSize(readBufferSize)
@@ -56,6 +70,7 @@ class BlockingChannel( val host: String,
         channel.socket.setSoTimeout(readTimeoutMs)
         channel.socket.setKeepAlive(true)
         channel.socket.setTcpNoDelay(true)
+        // 连接socket
         channel.socket.connect(new InetSocketAddress(host, port), connectTimeoutMs)
 
         writeChannel = channel
@@ -77,7 +92,7 @@ class BlockingChannel( val host: String,
     }
   }
   
-  def disconnect() = lock synchronized {
+  def disconnect(): Unit = lock synchronized {
     if(channel != null) {
       swallow(channel.close())
       swallow(channel.socket.close())
@@ -93,7 +108,7 @@ class BlockingChannel( val host: String,
     connected = false
   }
 
-  def isConnected = connected
+  def isConnected: Boolean = connected
 
   def send(request: RequestOrResponse):Int = {
     if(!connected)
