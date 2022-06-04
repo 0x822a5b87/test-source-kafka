@@ -37,13 +37,20 @@ class SyncProducer(val config: SyncProducerConfig) extends Logging {
 
   private val lock = new Object()
   @volatile private var shutdown: Boolean = false
-  private val blockingChannel = new BlockingChannel(config.host, config.port, BlockingChannel.UseDefaultBufferSize,
+  /**
+   * [[BlockingChannel]]包含了到broker的实际的[[java.net.Socket]]连接
+   */
+  private val blockingChannel = new BlockingChannel(
+    config.host, config.port, BlockingChannel.UseDefaultBufferSize,
     config.sendBufferBytes, config.requestTimeoutMs)
-  val producerRequestStats = ProducerRequestStatsRegistry.getProducerRequestStats(config.clientId)
+  /**
+   * 记录clientId对应的producer发往所有brokers的metrics
+   */
+  val producerRequestStats: ProducerRequestStats = ProducerRequestStatsRegistry.getProducerRequestStats(config.clientId)
 
   trace("Instantiating Scala Sync Producer with properties: %s".format(config.props))
 
-  private def verifyRequest(request: RequestOrResponse) = {
+  private def verifyRequest(request: RequestOrResponse): Unit = {
     /**
      * This seems a little convoluted, but the idea is to turn on verification simply changing log4j settings
      * Also, when verification is turned on, care should be taken to see that the logs don't fill up with unnecessary
@@ -51,26 +58,33 @@ class SyncProducer(val config: SyncProducerConfig) extends Logging {
      */
     if (logger.isDebugEnabled) {
       val buffer = new BoundedByteBufferSend(request).buffer
-      trace("verifying sendbuffer of size " + buffer.limit)
+      trace("verifying send buffer of size " + buffer.limit)
       val requestTypeId = buffer.getShort()
       if(requestTypeId == RequestKeys.ProduceKey) {
         val request = ProducerRequest.readFrom(buffer)
-        trace(request.toString)
+        trace(request.toString())
       }
     }
   }
 
   /**
-   * Common functionality for the public send methods
+   * send MetadataRequest和send ProducerRequest都会使用该命令
    */
   private def doSend(request: RequestOrResponse, readResponse: Boolean = true): Receive = {
     lock synchronized {
+      // 输出debug日志用于调试
       verifyRequest(request)
+
+      /**
+       * 如果[[blockingChannel]]没有连接，则建立连接，建立失败则抛出异常并退出
+       */
       getOrMakeConnection()
 
       var response: Receive = null
       try {
+        //发送请求
         blockingChannel.send(request)
+        //读取响应
         if(readResponse)
           response = blockingChannel.receive()
         else
@@ -87,19 +101,20 @@ class SyncProducer(val config: SyncProducerConfig) extends Logging {
   }
 
   /**
-   * Send a message. If the producerRequest had required.request.acks=0, then the
-   * returned response object is null
+   * 发送[[ProducerRequest]]，如果required.request.acks=0，则[[ProducerResponse]]为null
    */
   def send(producerRequest: ProducerRequest): ProducerResponse = {
     val requestSize = producerRequest.sizeInBytes
+    //记录metrics
     producerRequestStats.getProducerRequestStats(config.host, config.port).requestSizeHist.update(requestSize)
-    producerRequestStats.getProducerRequestAllBrokersStats.requestSizeHist.update(requestSize)
+    producerRequestStats.getProducerRequestAllBrokersStats().requestSizeHist.update(requestSize)
 
     var response: Receive = null
     val specificTimer = producerRequestStats.getProducerRequestStats(config.host, config.port).requestTimer
-    val aggregateTimer = producerRequestStats.getProducerRequestAllBrokersStats.requestTimer
+    val aggregateTimer = producerRequestStats.getProducerRequestAllBrokersStats().requestTimer
     aggregateTimer.time {
       specificTimer.time {
+        //执行实际的发送
         response = doSend(producerRequest, if(producerRequest.requiredAcks == 0) false else true)
       }
     }
@@ -114,7 +129,7 @@ class SyncProducer(val config: SyncProducerConfig) extends Logging {
     TopicMetadataResponse.readFrom(response.buffer)
   }
 
-  def close() = {
+  def close(): Unit = {
     lock synchronized {
       disconnect()
       shutdown = true
@@ -125,7 +140,7 @@ class SyncProducer(val config: SyncProducerConfig) extends Logging {
    * Disconnect from current channel, closing connection.
    * Side effect: channel field is set to null on successful disconnect
    */
-  private def disconnect() {
+  private def disconnect(): Unit = {
     try {
       info("Disconnecting from " + formatAddress(config.host, config.port))
       blockingChannel.disconnect()
@@ -140,17 +155,16 @@ class SyncProducer(val config: SyncProducerConfig) extends Logging {
         blockingChannel.connect()
         info("Connected to " + formatAddress(config.host, config.port) + " for producing")
       } catch {
-        case e: Exception => {
+        case e: Exception =>
           disconnect()
           error("Producer connection to " + formatAddress(config.host, config.port) + " unsuccessful", e)
           throw e
-        }
       }
     }
     blockingChannel
   }
 
-  private def getOrMakeConnection() {
+  private def getOrMakeConnection(): Unit = {
     if(!blockingChannel.isConnected) {
       connect()
     }

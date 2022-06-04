@@ -29,7 +29,7 @@ class Producer[K,V](private val underlying: kafka.producer.Producer[K,V]) // for
    * synchronous or the asynchronous producer
    * @param message the producer data object that encapsulates the topic, key and message data
    */
-  def send(message: KeyedMessage[K,V]) {
+  def send(message: KeyedMessage[K,V]): Unit = {
     underlying.send(message)
   }
 
@@ -37,7 +37,7 @@ class Producer[K,V](private val underlying: kafka.producer.Producer[K,V]) // for
    * Use this API to send data to multiple topics
    * @param messages list of producer data objects that encapsulate the topic, key and message data
    */
-  def send(messages: java.util.List[KeyedMessage[K,V]]) {
+  def send(messages: java.util.List[KeyedMessage[K,V]]): Unit = {
     import collection.JavaConversions._
     underlying.send((messages: mutable.Buffer[KeyedMessage[K,V]]).toSeq: _*)
   }
@@ -46,5 +46,5 @@ class Producer[K,V](private val underlying: kafka.producer.Producer[K,V]) // for
    * Close API to close the producer pool connections to all Kafka brokers. Also closes
    * the zookeeper client connection if one exists
    */
-  def close = underlying.close
+  def close(): Unit = underlying.close()
 }

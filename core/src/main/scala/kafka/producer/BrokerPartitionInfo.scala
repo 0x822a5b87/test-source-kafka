@@ -16,36 +16,41 @@
 */
 package kafka.producer
 
-import collection.mutable.HashMap
 import kafka.api.TopicMetadata
-import kafka.common.KafkaException
-import kafka.utils.Logging
-import kafka.common.ErrorMapping
 import kafka.client.ClientUtils
+import kafka.cluster.Broker
+import kafka.common.{ErrorMapping, KafkaException}
+import kafka.utils.Logging
 
+import scala.collection.mutable
 
+/**
+ * 保存了topic->[[TopicMetadata]]的相关信息，提供了查询topic的partition信息的能力
+ *
+ * @param producerConfig     配置文件，在初始化时通过配置文件解析broker列表，因为查询TopicMetadata需要向随机的broker发送TopicMetadataRequest
+ * @param producerPool       [[ProducerPool]]，保存了到broker的[[SyncProducer]]
+ * @param topicPartitionInfo topic -> [[TopicMetadata]]，会在某些场景下更新
+ */
 class BrokerPartitionInfo(producerConfig: ProducerConfig,
                           producerPool: ProducerPool,
-                          topicPartitionInfo: HashMap[String, TopicMetadata])
+                          topicPartitionInfo: mutable.HashMap[String, TopicMetadata])
         extends Logging {
-  val brokerList = producerConfig.brokerList
-  val brokers = ClientUtils.parseBrokerList(brokerList)
+  val brokerList: String = producerConfig.brokerList
+  val brokers: Seq[Broker] = ClientUtils.parseBrokerList(brokerList)
 
   /**
-   * Return a sequence of (brokerId, numPartitions).
-   * @param topic the topic for which this information is to be returned
-   * @return a sequence of (brokerId, numPartitions). Returns a zero-length
-   * sequence if no brokers are available.
+   * 查询某个topic的所有Partition对应的leaderBrokerIdOption
+   * @param topic 查询的topic
+   * @return Seq[[[kafka.common.TopicAndPartition]] -> leaderBrokerIdOption]，如果没有可用broker返回长度为0的序列
    */
   def getBrokerPartitionInfo(topic: String, correlationId: Int): Seq[PartitionAndLeader] = {
     debug("Getting broker partition info for topic %s".format(topic))
-    // check if the cache has metadata for this topic
     val topicMetadata = topicPartitionInfo.get(topic)
     val metadata: TopicMetadata =
       topicMetadata match {
         case Some(m) => m
         case None =>
-          // refresh the topic metadata cache
+          // 如果没有找到，则通过向broker发送TopicMetadataRequest来更新
           updateInfo(Set(topic), correlationId)
           val topicMetadata = topicPartitionInfo.get(topic)
           topicMetadata match {
@@ -54,41 +59,47 @@ class BrokerPartitionInfo(producerConfig: ProducerConfig,
           }
       }
     val partitionMetadata = metadata.partitionsMetadata
-    if(partitionMetadata.size == 0) {
+    //如果没有topic对应的partition信息则抛出异常
+    if(partitionMetadata.isEmpty) {
       if(metadata.errorCode != ErrorMapping.NoError) {
         throw new KafkaException(ErrorMapping.exceptionFor(metadata.errorCode))
       } else {
         throw new KafkaException("Topic metadata %s has empty partition metadata and no error code".format(metadata))
       }
     }
+    //获取partition对应的leaderIdOption，并按照partitionId从小到大进行排序并返回
     partitionMetadata.map { m =>
       m.leader match {
         case Some(leader) =>
           debug("Partition [%s,%d] has leader %d".format(topic, m.partitionId, leader.id))
-          new PartitionAndLeader(topic, m.partitionId, Some(leader.id))
+          PartitionAndLeader(topic, m.partitionId, Some(leader.id))
         case None =>
           debug("Partition [%s,%d] does not have a leader yet".format(topic, m.partitionId))
-          new PartitionAndLeader(topic, m.partitionId, None)
+          PartitionAndLeader(topic, m.partitionId, None)
       }
     }.sortWith((s, t) => s.partitionId < t.partitionId)
   }
 
   /**
-   * It updates the cache by issuing a get topic metadata request to a random broker.
+   * 通过向随机的broker发送[[kafka.javaapi.TopicMetadataRequest]]来更新[[ProducerPool]]内部的缓存
    * @param topics the topics for which the metadata is to be fetched
    */
-  def updateInfo(topics: Set[String], correlationId: Int) {
+  def updateInfo(topics: Set[String], correlationId: Int): Unit = {
     var topicsMetadata: Seq[TopicMetadata] = Nil
     val topicMetadataResponse = ClientUtils.fetchTopicMetadata(topics, brokers, producerConfig, correlationId)
     topicsMetadata = topicMetadataResponse.topicsMetadata
-    // throw partition specific exception
+
+    /**
+     * 在[[TopicMetadata]]没有错误时，更新[[topicPartitionInfo]]，并在存在错误时输出topic和partition相关的告警日志
+     */
     topicsMetadata.foreach(tmd =>{
       trace("Metadata for topic %s is %s".format(tmd.topic, tmd))
       if(tmd.errorCode == ErrorMapping.NoError) {
         topicPartitionInfo.put(tmd.topic, tmd)
-      } else
+      } else {
         warn("Error while fetching metadata [%s] for topic [%s]: %s ".format(tmd, tmd.topic, ErrorMapping.exceptionFor(tmd.errorCode).getClass))
-      tmd.partitionsMetadata.foreach(pmd =>{
+      }
+      tmd.partitionsMetadata.foreach(pmd => {
         if (pmd.errorCode != ErrorMapping.NoError && pmd.errorCode == ErrorMapping.LeaderNotAvailableCode) {
           warn("Error while fetching metadata %s for topic partition [%s,%d]: [%s]".format(pmd, tmd.topic, pmd.partitionId,
             ErrorMapping.exceptionFor(pmd.errorCode).getClass))
@@ -97,7 +108,7 @@ class BrokerPartitionInfo(producerConfig: ProducerConfig,
     })
     producerPool.updateProducer(topicsMetadata)
   }
-  
+
 }
 
 case class PartitionAndLeader(topic: String, partitionId: Int, leaderBrokerIdOpt: Option[Int])

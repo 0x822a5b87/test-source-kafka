@@ -17,50 +17,66 @@
 
 package kafka.producer.async
 
+import kafka.api.{ProducerRequest, TopicMetadata}
 import kafka.common._
-import kafka.message.{NoCompressionCodec, Message, ByteBufferMessageSet}
+import kafka.message.{ByteBufferMessageSet, Message, NoCompressionCodec}
 import kafka.producer._
 import kafka.serializer.Encoder
-import kafka.utils.{Utils, Logging, SystemTime}
-import scala.util.Random
-import scala.collection.{Seq, Map}
-import scala.collection.mutable.{ArrayBuffer, HashMap, Set}
+import kafka.utils.{Logging, SystemTime, Utils}
+
 import java.util.concurrent.atomic._
-import kafka.api.{TopicMetadata, ProducerRequest}
+import scala.collection.mutable.ArrayBuffer
+import scala.collection.{Map, Seq, mutable}
+import scala.util.Random
 
 class DefaultEventHandler[K,V](config: ProducerConfig,
                                private val partitioner: Partitioner,
                                private val encoder: Encoder[V],
                                private val keyEncoder: Encoder[K],
                                private val producerPool: ProducerPool,
-                               private val topicPartitionInfos: HashMap[String, TopicMetadata] = new HashMap[String, TopicMetadata])
+                               private val topicPartitionInfos: mutable.HashMap[String, TopicMetadata] = new mutable.HashMap[String, TopicMetadata])
   extends EventHandler[K,V] with Logging {
-  val isSync = ("sync" == config.producerType)
+  //是否同步发送
+  val isSync: Boolean = "sync" == config.producerType
 
+  //获取客户端发送消息的correlationId，注意，producer是客户端。
   val correlationId = new AtomicInteger(0)
   val brokerPartitionInfo = new BrokerPartitionInfo(config, producerPool, topicPartitionInfos)
 
+  /**
+   * [[TopicMetadata]]的刷新间隔，producer会在两种情况下刷新metadata
+   * 1. 查询元数据失败（partition missing， leader not available）
+   * 2. 通过此参数间隔定时的刷新
+   */
   private val topicMetadataRefreshInterval = config.topicMetadataRefreshIntervalMs
+  //metadata最后刷新时间
   private var lastTopicMetadataRefreshTime = 0L
-  private val topicMetadataToRefresh = Set.empty[String]
-  private val sendPartitionPerTopicCache = HashMap.empty[String, Int]
+  private val topicMetadataToRefresh = mutable.Set.empty[String]
+  //message在未指定partitionKey时会随机的发往一个partition，就缓存在这个partition中
+  //该缓存会定期刷新，或者在发送失败时刷新
+  //所以如果不指定partitionKey的话，可以发现每一个producer会在某一段时间内写入到某一个特定的partition
+  //经过一段时间后，又写入另一个特定的partition
+  private val sendPartitionPerTopicCache = mutable.HashMap.empty[String, Int]
 
   private val producerStats = ProducerStatsRegistry.getProducerStats(config.clientId)
   private val producerTopicStats = ProducerTopicStatsRegistry.getProducerTopicStats(config.clientId)
 
-  def handle(events: Seq[KeyedMessage[K,V]]) {
+  def handle(events: Seq[KeyedMessage[K,V]]): Unit = {
+    //序列化数据
     val serializedData = serialize(events)
+    //metrics
     serializedData.foreach {
       keyed =>
         val dataSize = keyed.message.payloadSize
         producerTopicStats.getProducerTopicStats(keyed.topic).byteRate.mark(dataSize)
-        producerTopicStats.getProducerAllTopicsStats.byteRate.mark(dataSize)
+        producerTopicStats.getProducerAllTopicsStats().byteRate.mark(dataSize)
     }
     var outstandingProduceRequests = serializedData
     var remainingRetries = config.messageSendMaxRetries + 1
     val correlationIdStart = correlationId.get()
     debug("Handling %d events".format(events.size))
-    while (remainingRetries > 0 && outstandingProduceRequests.size > 0) {
+    while (remainingRetries > 0 && outstandingProduceRequests.nonEmpty) {
+      //将发送的所有KeyMessage中包含的topic增加到带刷新的元数据中，在合适的时机刷新这些topic对应的元数据
       topicMetadataToRefresh ++= outstandingProduceRequests.map(_.topic)
       if (topicMetadataRefreshInterval >= 0 &&
           SystemTime.milliseconds - lastTopicMetadataRefreshTime > topicMetadataRefreshInterval) {
@@ -69,8 +85,10 @@ class DefaultEventHandler[K,V](config: ProducerConfig,
         topicMetadataToRefresh.clear
         lastTopicMetadataRefreshTime = SystemTime.milliseconds
       }
+      //发送数据
       outstandingProduceRequests = dispatchSerializedData(outstandingProduceRequests)
-      if (outstandingProduceRequests.size > 0) {
+      //如果返回不为空，说明存在数据发送失败，更新元数据，增加重试次数
+      if (outstandingProduceRequests.nonEmpty) {
         info("Back off for %d ms before retrying send. Remaining retries = %d".format(config.retryBackoffMs, remainingRetries-1))
         // back off and update the topic metadata cache before attempting another send operation
         Thread.sleep(config.retryBackoffMs)
@@ -81,7 +99,8 @@ class DefaultEventHandler[K,V](config: ProducerConfig,
         producerStats.resendRate.mark()
       }
     }
-    if(outstandingProduceRequests.size > 0) {
+    //重试次数用完，仍然有数据发送失败，则抛出异常
+    if(outstandingProduceRequests.nonEmpty) {
       producerStats.failedSendRate.mark()
       val correlationIdEnd = correlationId.get()
       error("Failed to send requests for topics %s with correlation ids in [%d,%d]"
@@ -91,21 +110,30 @@ class DefaultEventHandler[K,V](config: ProducerConfig,
     }
   }
 
+  /**
+   * 将messages发送到对应的partition，并返回发送失败的messages
+   *
+   * @param messages 等待发送的messages
+   * @return 发送失败的messages
+   */
   private def dispatchSerializedData(messages: Seq[KeyedMessage[K,Message]]): Seq[KeyedMessage[K, Message]] = {
+    //brokerId -> {[TopicAndPartition] -> Seq[KeyedMessage]}
     val partitionedDataOpt = partitionAndCollate(messages)
     partitionedDataOpt match {
       case Some(partitionedData) =>
         val failedProduceRequests = new ArrayBuffer[KeyedMessage[K,Message]]
         try {
-          for ((brokerid, messagesPerBrokerMap) <- partitionedData) {
-            if (logger.isTraceEnabled)
-              messagesPerBrokerMap.foreach(partitionAndEvent =>
-                trace("Handling event for Topic: %s, Broker: %d, Partitions: %s".format(partitionAndEvent._1, brokerid, partitionAndEvent._2)))
+          for ((brokerId, messagesPerBrokerMap) <- partitionedData) {
+            //按照压缩相关配置，将Seq[KeyedMessage[K, Message]]转换为[[ByteBufferMessageSet]]
             val messageSetPerBroker = groupMessagesToSet(messagesPerBrokerMap)
-
-            val failedTopicPartitions = send(brokerid, messageSetPerBroker)
+            //发送数据到对应的broker，并返回发送失败的partitions
+            val failedTopicPartitions = send(brokerId, messageSetPerBroker)
             failedTopicPartitions.foreach(topicPartition => {
               messagesPerBrokerMap.get(topicPartition) match {
+                //记录发送失败的消息。
+                //TODO
+                //注意，这里的data是整个partition的全部消息，需要确认一下
+                //kafka的写入机制对于某个partition是否存在事务
                 case Some(data) => failedProduceRequests.appendAll(data)
                 case None => // nothing
               }
@@ -115,7 +143,8 @@ class DefaultEventHandler[K,V](config: ProducerConfig,
           case t: Throwable => error("Failed to send messages", t)
         }
         failedProduceRequests
-      case None => // all produce requests failed
+      case None =>
+        //分区失败，所有的消息都发送失败
         messages
     }
   }
@@ -143,27 +172,40 @@ class DefaultEventHandler[K,V](config: ProducerConfig,
     serializedMessages
   }
 
+  /**
+   * 分拣messages，分拣之后的结果是：
+   * brokerId -> {[TopicAndPartition] -> Seq[KeyedMessage]}
+   * 记得我们前面提到的[[SyncProducer]]是连接到每个broker的，此时我们只需要将结果包含的数据找到对应的[[SyncProducer]]即可发送
+   * @param messages 等待发送的消息
+   * @return
+   */
   def partitionAndCollate(messages: Seq[KeyedMessage[K,Message]]): Option[Map[Int, collection.mutable.Map[TopicAndPartition, Seq[KeyedMessage[K,Message]]]]] = {
-    val ret = new HashMap[Int, collection.mutable.Map[TopicAndPartition, Seq[KeyedMessage[K,Message]]]]
+    val ret = new mutable.HashMap[Int, collection.mutable.Map[TopicAndPartition, Seq[KeyedMessage[K,Message]]]]
     try {
       for (message <- messages) {
+        //获取message对应的Seq[PartitionAndLeader]
         val topicPartitionsList = getPartitionListForTopic(message)
+        //根据message.partitionKey来获取对应的partitionId
         val partitionIndex = getPartition(message.topic, message.partitionKey, topicPartitionsList)
+        //获取PartitionAndLeader
         val brokerPartition = topicPartitionsList(partitionIndex)
 
-        // postpone the failure until the send operation, so that requests for other brokers are handled correctly
+        //将失败推迟到send操作，这样到其他broker的request是正常处理的
         val leaderBrokerId = brokerPartition.leaderBrokerIdOpt.getOrElse(-1)
 
-        var dataPerBroker: HashMap[TopicAndPartition, Seq[KeyedMessage[K,Message]]] = null
+        //获取发送到发往每个broker的数据，如果ret中不存在就创建它
+        var dataPerBroker: mutable.HashMap[TopicAndPartition, Seq[KeyedMessage[K,Message]]] = null
         ret.get(leaderBrokerId) match {
           case Some(element) =>
-            dataPerBroker = element.asInstanceOf[HashMap[TopicAndPartition, Seq[KeyedMessage[K,Message]]]]
+            dataPerBroker = element.asInstanceOf[mutable.HashMap[TopicAndPartition, Seq[KeyedMessage[K,Message]]]]
           case None =>
-            dataPerBroker = new HashMap[TopicAndPartition, Seq[KeyedMessage[K,Message]]]
+            dataPerBroker = new mutable.HashMap[TopicAndPartition, Seq[KeyedMessage[K,Message]]]
+            //注意这里，所有不可用的partition都存放在-1这个key下
             ret.put(leaderBrokerId, dataPerBroker)
         }
 
         val topicAndPartition = TopicAndPartition(message.topic, brokerPartition.partitionId)
+        //获取发送到每个broker的数据，并且按照TopicAndPartition分组
         var dataPerTopicPartition: ArrayBuffer[KeyedMessage[K,Message]] = null
         dataPerBroker.get(topicAndPartition) match {
           case Some(element) =>
@@ -193,8 +235,9 @@ class DefaultEventHandler[K,V](config: ProducerConfig,
   }
 
   /**
-   * Retrieves the partition id and throws an UnknownTopicOrPartitionException if
-   * the value of partition is not between 0 and numPartitions-1
+   * 根据topic和[[KeyedMessage.partitionKey]]获取指定的partitionIndex。
+   * 注意，这里返回的是在topicPartitionList内的索引，而不是partitionId
+   * 在获取的partitionIndex不在0和numPartitions-1内时抛出[[UnknownTopicOrPartitionException]]
    * @param topic The topic
    * @param key the partition key
    * @param topicPartitionList the list of available partitions
@@ -206,15 +249,15 @@ class DefaultEventHandler[K,V](config: ProducerConfig,
       throw new UnknownTopicOrPartitionException("Topic " + topic + " doesn't exist")
     val partition =
       if(key == null) {
-        // If the key is null, we don't really need a partitioner
-        // So we look up in the send partition cache for the topic to decide the target partition
+        //如果partitionKey为空，我们从缓存中随机选择一个partition
         val id = sendPartitionPerTopicCache.get(topic)
         id match {
           case Some(partitionId) =>
-            // directly return the partitionId without checking availability of the leader,
-            // since we want to postpone the failure until the send operation anyways
+            //直接返回partitionId而不用检查leader可用性
+            //因为我们都想将失败推迟到send
             partitionId
           case None =>
+            //从leader可用的partition中随机的选择一个partition作为目标地址，并更新缓存
             val availablePartitions = topicPartitionList.filter(_.leaderBrokerIdOpt.isDefined)
             if (availablePartitions.isEmpty)
               throw new LeaderNotAvailableException("No leader for any partition in topic " + topic)
@@ -223,8 +266,13 @@ class DefaultEventHandler[K,V](config: ProducerConfig,
             sendPartitionPerTopicCache.put(topic, partitionId)
             partitionId
         }
-      } else
+      } else {
+        /**
+         * 如果partitionKey不为null，则使用分区函数进行分区
+         * [[DefaultPartitioner]]其实就是随机发送到某个分区
+         */
         partitioner.partition(key, numPartitions)
+      }
     if(partition < 0 || partition >= numPartitions)
       throw new UnknownTopicOrPartitionException("Invalid partition id: " + partition + " for topic " + topic +
         "; Valid values are in the inclusive range of [0, " + (numPartitions-1) + "]")
@@ -233,48 +281,40 @@ class DefaultEventHandler[K,V](config: ProducerConfig,
   }
 
   /**
-   * Constructs and sends the produce request based on a map from (topic, partition) -> messages
+   * 基于一个(topic, partition) -> messages的map构造并发送produce request
    *
    * @param brokerId the broker that will receive the request
    * @param messagesPerTopic the messages as a map from (topic, partition) -> messages
    * @return the set (topic, partitions) messages which incurred an error sending or processing
    */
   private def send(brokerId: Int, messagesPerTopic: collection.mutable.Map[TopicAndPartition, ByteBufferMessageSet]) = {
+    /**
+     * 在[[partitionAndCollate]]中，我们将所有leader不可用的都放在了-1这个key下
+     */
     if(brokerId < 0) {
-      warn("Failed to send data since partitions %s don't have a leader".format(messagesPerTopic.map(_._1).mkString(",")))
+      warn("Failed to send data since partitions %s don't have a leader".format(messagesPerTopic.keys.mkString(",")))
       messagesPerTopic.keys.toSeq
-    } else if(messagesPerTopic.size > 0) {
+    } else if(messagesPerTopic.nonEmpty) {
       val currentCorrelationId = correlationId.getAndIncrement
+      //构造produce request
       val producerRequest = new ProducerRequest(currentCorrelationId, config.clientId, config.requestRequiredAcks,
         config.requestTimeoutMs, messagesPerTopic)
       var failedTopicPartitions = Seq.empty[TopicAndPartition]
       try {
+        //从ProducerPool中获取对应的SyncProducer
         val syncProducer = producerPool.getProducer(brokerId)
-        debug("Producer sending messages with correlation id %d for topics %s to broker %d on %s:%d"
-          .format(currentCorrelationId, messagesPerTopic.keySet.mkString(","), brokerId, syncProducer.config.host, syncProducer.config.port))
+        //发送消息
         val response = syncProducer.send(producerRequest)
-        debug("Producer sent messages with correlation id %d for topics %s to broker %d on %s:%d"
-          .format(currentCorrelationId, messagesPerTopic.keySet.mkString(","), brokerId, syncProducer.config.host, syncProducer.config.port))
         if(response != null) {
-          if (response.status.size != producerRequest.data.size)
+          //request  是 Map[TopicAndPartition, ByteBufferMessageSet]
+          //response 是 Map[TopicAndPartition, ProducerResponseStatus]
+          //request和response是按照partition一一对应的
+          if (response.status.size != producerRequest.data.size) {
             throw new KafkaException("Incomplete response (%s) for producer request (%s)".format(response, producerRequest))
-          if (logger.isTraceEnabled) {
-            val successfullySentData = response.status.filter(_._2.error == ErrorMapping.NoError)
-            successfullySentData.foreach(m => messagesPerTopic(m._1).foreach(message =>
-              trace("Successfully sent message: %s".format(if(message.message.isNull) null else Utils.readString(message.message.payload)))))
           }
+          //找到所有的失败的partition
           val failedPartitionsAndStatus = response.status.filter(_._2.error != ErrorMapping.NoError).toSeq
           failedTopicPartitions = failedPartitionsAndStatus.map(partitionStatus => partitionStatus._1)
-          if(failedTopicPartitions.size > 0) {
-            val errorString = failedPartitionsAndStatus
-              .sortWith((p1, p2) => p1._1.topic.compareTo(p2._1.topic) < 0 ||
-                                    (p1._1.topic.compareTo(p2._1.topic) == 0 && p1._1.partition < p2._1.partition))
-              .map{
-                case(topicAndPartition, status) =>
-                  topicAndPartition.toString + ": " + ErrorMapping.exceptionFor(status.error).getClass.getName
-              }.mkString(",")
-            warn("Produce request with correlation id %d failed due to %s".format(currentCorrelationId, errorString))
-          }
           failedTopicPartitions
         } else {
           Seq.empty[TopicAndPartition]
@@ -282,7 +322,7 @@ class DefaultEventHandler[K,V](config: ProducerConfig,
       } catch {
         case t: Throwable =>
           warn("Failed to send producer request with correlation id %d to broker %d with data for partitions %s"
-            .format(currentCorrelationId, brokerId, messagesPerTopic.map(_._1).mkString(",")), t)
+            .format(currentCorrelationId, brokerId, messagesPerTopic.keys.mkString(",")), t)
           messagesPerTopic.keys.toSeq
       }
     } else {
@@ -290,47 +330,42 @@ class DefaultEventHandler[K,V](config: ProducerConfig,
     }
   }
 
-  private def groupMessagesToSet(messagesPerTopicAndPartition: collection.mutable.Map[TopicAndPartition, Seq[KeyedMessage[K,Message]]]) = {
-    /** enforce the compressed.topics config here.
-      *  If the compression codec is anything other than NoCompressionCodec,
-      *    Enable compression only for specified topics if any
-      *    If the list of compressed topics is empty, then enable the specified compression codec for all topics
-      *  If the compression codec is NoCompressionCodec, compression is disabled for all topics
-      */
-
+  /**
+   * 将按[[TopicAndPartition]]分组后的消息序列转换为[[ByteBufferMessageSet]]
+   * @param messagesPerTopicAndPartition 等待转换的消息
+   * @return 转换后的[[ByteBufferMessageSet]]
+   */
+  private def groupMessagesToSet(messagesPerTopicAndPartition: collection.mutable.Map[TopicAndPartition, Seq[KeyedMessage[K, Message]]]) = {
     val messagesPerTopicPartition = messagesPerTopicAndPartition.map { case (topicAndPartition, messages) =>
+      //当到达这里时已经确定messages是需要发送到同一个partition了
       val rawMessages = messages.map(_.message)
-      ( topicAndPartition,
+      (topicAndPartition,
+        //不压缩消息
         config.compressionCodec match {
           case NoCompressionCodec =>
             debug("Sending %d messages with no compression to %s".format(messages.size, topicAndPartition))
             new ByteBufferMessageSet(NoCompressionCodec, rawMessages: _*)
           case _ =>
+            //如果compressedTopics为空，则对所有的topic开启压缩，否则对特定的topic开启压缩
             config.compressedTopics.size match {
               case 0 =>
-                debug("Sending %d messages with compression codec %d to %s"
-                  .format(messages.size, config.compressionCodec.codec, topicAndPartition))
                 new ByteBufferMessageSet(config.compressionCodec, rawMessages: _*)
               case _ =>
-                if(config.compressedTopics.contains(topicAndPartition.topic)) {
-                  debug("Sending %d messages with compression codec %d to %s"
-                    .format(messages.size, config.compressionCodec.codec, topicAndPartition))
+                if (config.compressedTopics.contains(topicAndPartition.topic)) {
                   new ByteBufferMessageSet(config.compressionCodec, rawMessages: _*)
                 }
                 else {
-                  debug("Sending %d messages to %s with no compression as it is not in compressed.topics - %s"
-                    .format(messages.size, topicAndPartition, config.compressedTopics.toString))
                   new ByteBufferMessageSet(NoCompressionCodec, rawMessages: _*)
                 }
             }
         }
-        )
+      )
     }
     messagesPerTopicPartition
   }
 
-  def close() {
+  def close(): Unit = {
     if (producerPool != null)
-      producerPool.close
+      producerPool.close()
   }
 }

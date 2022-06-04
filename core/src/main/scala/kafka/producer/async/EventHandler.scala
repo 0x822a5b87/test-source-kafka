@@ -27,10 +27,10 @@ trait EventHandler[K,V] {
    * Callback to dispatch the batched data and send it to a Kafka server
    * @param events the data sent to the producer
   */
-  def handle(events: Seq[KeyedMessage[K,V]])
+  def handle(events: Seq[KeyedMessage[K,V]]): Unit
 
   /**
    * Cleans up and shuts down the event handler
   */
-  def close
+  def close(): Unit
 }

@@ -9,6 +9,7 @@
 1. [broker概述](./ch03.md)
 2. [broker的基本模块](./ch04.md)
 3. [broker的控制管理模块](./ch05.md)
+3. [生产者](./ch07.md)
 
 ## 编译
 
@@ -646,7 +647,7 @@
 
 ### ReplicaDeletionineligible 状态如何变幻为其他的状态？
 
-
+### kafka.api.Producer和kafka集群会存在多少连接？
 
 
 
