@@ -10,6 +10,7 @@
 2. [broker的基本模块](./ch04.md)
 3. [broker的控制管理模块](./ch05.md)
 3. [生产者](./ch07.md)
+3. [消费者](./ch08.md)
 
 ## 编译
 
@@ -208,6 +209,45 @@
 > 对于 `currLeaderIsrAndControllerEpoch.leaderAndIsr.leader == id` 这种是leader的分区，为什么是设置 partition 状态为 OnlinePartition？
 
 ### OffsetRequest 和 OffsetFetchRequest 的差别
+
+> - OffsetRequest 是 `[topic, partition, time, maxNumOffsets]`维度的，并且是基于segment查找的；
+> - OffsetFetchRequest 是 `[topic, partition, groupId]` 维度的。
+>
+> **这里有一个需要注意的问题是，在 `OffsetRequest` 中的 `time` 参数，这个值是用来和 `segment` 的 `lastModifiedTime` 来比较的，而不是和单条消息的timestamp来比较。**所以可能会出现以下情况：
+>
+> 1. 新建topic，此时segment为空
+> 2. [timestamp = 1000]写入一条数据，创建一个segment
+>
+> 2. [timestamp = 2000]写入一条数据，在segment上append
+> 3. [timestamp = 3000]写入一条数据，在segment上append
+> 4. 发送OffsetRequest("test", 0, 4000, 1) 得到 offset 为 3；
+> 5. 发送OffsetRequest("test", 0, 1500, 1) 查询offset失败，因为我们的segment的`lastModifiedTime==3000`，此时只有一个segment，也就是查找不到segment比1500更小的segment了。
+
+```scala
+case class OffsetFetchRequest(groupId: String,
+                              requestInfo: Seq[TopicAndPartition],
+                              versionId: Short = OffsetFetchRequest.CurrentVersion,
+                              correlationId: Int = 0,
+                              clientId: String = OffsetFetchRequest.DefaultClientId)
+    extends RequestOrResponse(Some(RequestKeys.OffsetFetchKey)) {
+    }
+```
+
+```scala
+case class OffsetRequest(requestInfo: Map[TopicAndPartition, PartitionOffsetRequestInfo],
+                         versionId: Short = OffsetRequest.CurrentVersion,
+                         correlationId: Int = 0,
+                         clientId: String = OffsetRequest.DefaultClientId,
+                         replicaId: Int = Request.OrdinaryConsumerId)
+    extends RequestOrResponse(Some(RequestKeys.OffsetsKey)) {
+    }
+```
+
+> PartitionOffsetRequestInfo
+
+```scala
+case class PartitionOffsetRequestInfo(time: Long, maxNumOffsets: Int)
+```
 
 ### OffsetManager#getOffsets 中只有 leader 提供服务
 

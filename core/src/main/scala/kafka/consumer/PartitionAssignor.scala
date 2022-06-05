@@ -68,12 +68,14 @@ class AssignmentContext(group: String, val consumerId: String, excludeInternalTo
 
 class RoundRobinAssignor() extends PartitionAssignor with Logging {
 
-  def assign(ctx: AssignmentContext) = {
+  def assign(ctx: AssignmentContext): scala.collection.Map[TopicAndPartition, ConsumerThreadId] = {
     val partitionOwnershipDecision = collection.mutable.Map[TopicAndPartition, ConsumerThreadId]()
 
-    // check conditions (a) and (b)
+    //检查条件是否满足
+    //取出第一个topic的Set<ConsumerThreadId>
     val (headTopic, headThreadIdSet) = (ctx.consumersForTopic.head._1, ctx.consumersForTopic.head._2.toSet)
     ctx.consumersForTopic.foreach { case (topic, threadIds) =>
+      //使用订阅的所有的topic对应的Set<ConsumerThreadId>，和第一个比较，必须完全相同。
       val threadIdSet = threadIds.toSet
       require(threadIdSet == headThreadIdSet,
               "Round-robin assignment is allowed only if all consumers in the group subscribe to the same topics, " +
@@ -82,23 +84,23 @@ class RoundRobinAssignor() extends PartitionAssignor with Logging {
               "Topic %s has the following available consumer streams: %s\n".format(headTopic, headThreadIdSet))
     }
 
+    //为所有的ConsumerThreadId创建一个循环迭代器
     val threadAssignor = Utils.circularIterator(headThreadIdSet.toSeq.sorted)
 
     info("Starting round-robin assignment with consumers " + ctx.consumers)
     val allTopicPartitions = ctx.partitionsForTopic.flatMap { case(topic, partitions) =>
+      //将{topic} -> {partitions}的映射修改为TopicAndPartition列表
       info("Consumer %s rebalancing the following partitions for topic %s: %s"
            .format(ctx.consumerId, topic, partitions))
       partitions.map(partition => {
         TopicAndPartition(topic, partition)
       })
     }.toSeq.sortWith((topicPartition1, topicPartition2) => {
-      /*
-       * Randomize the order by taking the hashcode to reduce the likelihood of all partitions of a given topic ending
-       * up on one consumer (if it has a high enough stream count).
-       */
+      //将TopicAndPartition列表按照hashCode随机排序，以减少某个topic的全部分区落在一个consumer的可能性
       topicPartition1.toString.hashCode < topicPartition2.toString.hashCode
     })
 
+    //将TopicAndPartition列表分配到不同的ConsumerThread
     allTopicPartitions.foreach(topicPartition => {
       val threadId = threadAssignor.next()
       if (threadId.consumer == ctx.consumerId)
@@ -120,14 +122,18 @@ class RoundRobinAssignor() extends PartitionAssignor with Logging {
  */
 class RangeAssignor() extends PartitionAssignor with Logging {
 
-  def assign(ctx: AssignmentContext) = {
+  def assign(ctx: AssignmentContext):scala.collection.Map[TopicAndPartition, ConsumerThreadId]= {
     val partitionOwnershipDecision = collection.mutable.Map[TopicAndPartition, ConsumerThreadId]()
 
     for ((topic, consumerThreadIdSet) <- ctx.myTopicThreadIds) {
+      //获取当前的消费者ID
       val curConsumers = ctx.consumersForTopic(topic)
+      //获取目标partition
       val curPartitions: Seq[Int] = ctx.partitionsForTopic(topic)
 
+      //每个ConsumerThread应该消费多少分区
       val nPartsPerConsumer = curPartitions.size / curConsumers.size
+      //多出来的分区
       val nConsumersWithExtraPart = curPartitions.size % curConsumers.size
 
       info("Consumer " + ctx.consumerId + " rebalancing the following partitions: " + curPartitions +
@@ -136,8 +142,33 @@ class RangeAssignor() extends PartitionAssignor with Logging {
       for (consumerThreadId <- consumerThreadIdSet) {
         val myConsumerPosition = curConsumers.indexOf(consumerThreadId)
         assert(myConsumerPosition >= 0)
+        /**
+         * 假设有6个partition，2个consumer，每个consumer包含2个thread
+         * 1. myConsumerPosition = 0, startPart = 0, nParts = 2
+         * 2. myConsumerPosition = 1, startPart = 2, nParts = 2
+         * 3. myConsumerPosition = 2, startPart = 4, nParts = 1
+         * 4. myConsumerPosition = 3, startPart = 5, nParts = 1
+         *
+         * val startPart = myConsumerPosition + myConsumerPosition.min(2)
+         * val nParts = 1 + (if (myConsumerPosition + 1 > 2) 0 else 1)
+         *
+         * 这个算法主要是计算两个值，{开始索引}和分到的partition数量。
+         * 我们可以这样理解这个算法：
+         * 1. nPartsPerConsumer 代表了每个区域最少负责的partition数量
+         * 2. nConsumersWithExtraPart 表示分配完之后多出来的partition数量，而这个partition数量是一定小于我们的thread的数量的。
+         *    那么，我们从索引 [0, 1, ...] 开始，每个thread分配一个剩余的partition。
+         *
+         * 所以，startPart = nPartsPerConsumer * myConsumerPosition + 步骤2所分配的partition数量。
+         * 而步骤2所分配的partition数量就是当前索引和nConsumersWithExtraPart的最小值。
+         * - 当myConsumerPosition < nConsumersWithExtraParts 时，我们还在继续分配，所以索引的偏移量和index有关；
+         * - 当myConsumerPosition >= nConsumersWithExtraParts时，分配已经结束，后续的都加上这个值即可；
+         *
+         * 而nParts在nConsumersWithExtraParts时没有分配完时，需要分配 nPartsPerConsumer + 1，分配完之后就是 nPartsPerConsumer
+         */
+        //计算开始索引
         val startPart = nPartsPerConsumer * myConsumerPosition + myConsumerPosition.min(nConsumersWithExtraPart)
-        val nParts = nPartsPerConsumer + (if (myConsumerPosition + 1 > nConsumersWithExtraPart) 0 else 1)
+        //计算自己分配了几个partition
+        val nParts = nPartsPerConsumer + (if (myConsumerPosition >= nConsumersWithExtraPart) 0 else 1)
 
         /**
          *   Range-partition the sorted partitions to consumers for better locality.

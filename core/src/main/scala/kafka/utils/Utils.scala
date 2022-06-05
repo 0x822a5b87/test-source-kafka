@@ -447,7 +447,7 @@ object Utils extends Logging {
    * @param coll An iterable over the underlying collection.
    * @return A circular iterator over the collection.
    */
-  def circularIterator[T](coll: Iterable[T]) = {
+  def circularIterator[T](coll: Iterable[T]): Iterator[T] = {
     val stream: Stream[T] =
       for (forever <- Stream.continually(1); t <- coll) yield t
     stream.iterator

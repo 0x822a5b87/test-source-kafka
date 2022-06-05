@@ -17,9 +17,8 @@
 
 package kafka.javaapi.consumer
 
+import kafka.javaapi.{FetchResponse, OffsetRequest}
 import kafka.utils.threadsafe
-import kafka.javaapi.FetchResponse
-import kafka.javaapi.OffsetRequest
 
 /**
  * A consumer of kafka messages

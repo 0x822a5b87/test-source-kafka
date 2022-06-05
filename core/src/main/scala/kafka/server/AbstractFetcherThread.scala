@@ -71,7 +71,7 @@ abstract class AbstractFetcherThread(name: String, clientId: String, sourceBroke
     simpleConsumer.close()
   }
 
-  override def doWork() {
+  override def doWork(): Unit = {
     inLock(partitionMapLock) {
       // doWork() 方法在 while 循环中调用，等待200ms可以避免忙等待。
       if (partitionMap.isEmpty)
